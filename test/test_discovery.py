@@ -54,7 +54,9 @@ for t in ths: t.join()
 time.sleep(2.3)
 s = json.load(open(stat))
 dd = {x["port"]: x for x in s["discovered"]}
-check(set(dd) == {PR, PT}, f"discovered ports {sorted(dd)}")
+check({PR, PT} <= set(dd), f"discovered ports {sorted(dd)}")
+# a full PING0 *request* (device announcing itself) is remembered, but a spoofed unsolicited *reply* is not
+check(not any(x["ip"] == "127.0.0.3" for x in s["discovered"]), "spoofed reply must not be recorded")
 check(dd[PR]["type"] == 1 and dd[PR]["device"] == "Speakers" and dd[PR]["app"] == "Voicemeeter" and dd[PR]["host"] == "PC-A?", dd[PR])
 check(dd[PT]["type"] == 2 and dd[PT]["host"] == "phone", dd[PT])
 check(all(r[1] == 28 + SVC and r[2] == 0x60 and r[3] == 0 and r[4] == 0 for r in seen_requests), f"request format {seen_requests}")
