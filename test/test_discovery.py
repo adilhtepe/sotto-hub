@@ -66,9 +66,13 @@ c.sendto(hdr(0, 4242) + bytes(SVC), ("127.0.0.1", HUB))
 data, _ = c.recvfrom(2048)
 check(len(data) == 28 + SVC and data[5] == 0x80 and struct.unpack("<I", data[24:28])[0] == 4242, "ping reply")
 check(data[28 + 292:28 + 299] == b"vbanhub", "reply app name")
-c.sendto(hdr(0, 99), ("127.0.0.1", HUB))
-try: c.recvfrom(2048); check(False, "short ping got a reply")
-except socket.timeout: pass
+check(struct.unpack("<I", data[28:32])[0] == 0xF, "bitType must be receiver+transmitter (+SPOT): 0xF")
+check(data[8:24].rstrip(b"\0") == b"PING", "request stream-name label echoed")
+check(struct.unpack("<I", data[28 + 12:28 + 16])[0] == 48000, "preferred rate")
+# header-only ping (some apps send only the header) is answered too, and the label is echoed
+c.sendto(hdr(0, 99, b"VBAN SPOT PING"), ("127.0.0.1", HUB))
+data, _ = c.recvfrom(2048)
+check(len(data) == 28 + SVC and data[5] == 0x80 and struct.unpack("<I", data[24:28])[0] == 99 and data[8:22] == b"VBAN SPOT PING", "header-only ping reply")
 
 p.send_signal(signal.SIGTERM); p.wait()
 print("PASS" if ok else "FAILED"); sys.exit(0 if ok else 1)

@@ -215,7 +215,14 @@ static int load_config(void)
 #define MAX_DISC 64
 #define MAX_DEST 24
 #define MAX_PORTS 8
-#define PING_TYPE_SERVER 0x01000000u
+/* bitType (spec rev 13): the hub receives from any number of transmitters and sends to any number of
+ * receivers, so it presents itself as a SPOT receptor (several streams) and a SPOT transmitter. */
+#define PING_TYPE_RECEPTOR         0x00000001u
+#define PING_TYPE_TRANSMITTER      0x00000002u
+#define PING_TYPE_RECEPTORSPOT     0x00000004u
+#define PING_TYPE_TRANSMITTERSPOT  0x00000008u
+#define PING_TYPE_HUB (PING_TYPE_RECEPTOR | PING_TYPE_TRANSMITTER | PING_TYPE_RECEPTORSPOT | PING_TYPE_TRANSMITTERSPOT)
+static const char *hub_name;      /* shown to VBAN apps (-N); default: OpenWrt VBAN hub */
 
 struct disc {
 	uint32_t ip;
@@ -264,9 +271,11 @@ static void refresh_ifaces(void)
 	freeifaddrs(ifa);
 }
 
-static void fill_ping(uint8_t *pkt, int reply, uint32_t fc)
+/* req_name: stream-name label to echo (16 bytes) from the request, or NULL for our own. */
+static void fill_ping(uint8_t *pkt, int reply, uint32_t fc, const uint8_t *req_name)
 {
 	uint8_t *d = pkt + VBAN_HDR;
+	const char *nm = hub_name && *hub_name ? hub_name : "OpenWrt VBAN hub";
 	uint32_t v;
 
 	memset(pkt, 0, SVC_PKT);
@@ -274,17 +283,30 @@ static void fill_ping(uint8_t *pkt, int reply, uint32_t fc)
 	pkt[4] = 0x60;                 /* SERVICE */
 	pkt[5] = reply ? 0x80 : 0;     /* function PING0 (+ reply bit) */
 	pkt[6] = 0;                    /* service IDENTIFICATION */
-	memcpy(pkt + 8, "VBANHUB PING", 12);
+	if (req_name)
+		memcpy(pkt + 8, req_name, NAME_LEN);
+	else
+		memcpy(pkt + 8, "VBAN SPOT PING", 14);
 	v = htole32(fc);
 	memcpy(pkt + 24, &v, 4);
-	v = htole32(PING_TYPE_SERVER);
+	v = htole32(PING_TYPE_HUB);
 	memcpy(d, &v, 4);
 	v = htole32(0x00000001u | 0x00000100u | 0x00010000u); /* audio, serial, text */
 	memcpy(d + 4, &v, 4);
+	v = htole32(48000);                                     /* PreferedRate */
+	memcpy(d + 12, &v, 4);
+	v = htole32(6000);                                      /* MinRate: the hub passes any rate through */
+	memcpy(d + 16, &v, 4);
+	v = htole32(705600);                                    /* MaxRate */
+	memcpy(d + 20, &v, 4);
 	d[29] = 1;                                              /* nVersion 0.1.0.0 */
-	strncpy((char *)d + 164, "OpenWrt VBAN hub", 63);       /* DeviceName */
+	strncpy((char *)d + 48, "EN", 7);                       /* LangCode */
+	strncpy((char *)d + 164, nm, 63);                       /* DeviceName */
+	strncpy((char *)d + 228, "OpenWrt", 63);                /* ManufacturerName */
 	strncpy((char *)d + 292, "vbanhub", 63);                /* ApplicationName */
 	gethostname((char *)d + 356, 63);                       /* HostName */
+	strncpy((char *)d + 420, nm, 127);                      /* UserName */
+	strncpy((char *)d + 548, "VBAN router: send streams here, receive them from here", 127); /* UserComment */
 }
 
 static void send_scan(int fd)
@@ -305,7 +327,7 @@ static void send_scan(int fd)
 	scan_id = scan_id ? scan_id + 1 : (uint32_t)now;
 	scan_until = now + 5;
 	last_scan = now;
-	fill_ping(pkt, 0, scan_id);
+	fill_ping(pkt, 0, scan_id, NULL);
 	for (i = 0; i < nd; i++)
 		for (j = 0; j < nports; j++) {
 			to.sin_addr.s_addr = dest[i];
@@ -360,18 +382,18 @@ static void handle_service(int fd, const uint8_t *p, unsigned len, const struct 
 	uint8_t rep[SVC_PKT];
 	uint32_t fc;
 
-	/* Only full PING0 packets (header + struct); anything shorter is ignored,
-	 * which also keeps replies from ever being larger than the request. */
-	if (p[6] != 0 || (p[5] & 0x7f) != 0 || len < SVC_PKT)
+	if (p[6] != 0 || (p[5] & 0x7f) != 0)
 		return;
 	memcpy(&fc, p + 24, 4);
 	fc = le32toh(fc);
-	if (p[5] & 0x80) {                      /* reply to our scan */
-		if (fc != scan_id || now > scan_until)
+	if (p[5] & 0x80) {                      /* reply to our scan: needs the full struct */
+		if (len < SVC_PKT || fc != scan_id || now > scan_until)
 			return;
 		record_disc(from, p + VBAN_HDR, now);
 		return;
 	}
+	/* Request: answer header-only pings too (some apps send just the header), so the hub shows up
+	 * in their device lists. Bounded by the global limit below and by the ingress-interface filter. */
 	/* request: ignore our own looped-back broadcast, rate-limit replies */
 	if (is_local(from->sin_addr.s_addr) && ntohs(from->sin_port) == listen_port)
 		return;
@@ -381,7 +403,7 @@ static void handle_service(int fd, const uint8_t *p, unsigned len, const struct 
 	}
 	if (++rl_cnt > 20)
 		return;
-	fill_ping(rep, 1, fc);
+	fill_ping(rep, 1, fc, p + 8);
 	sendto(fd, rep, sizeof(rep), MSG_DONTWAIT, (const struct sockaddr *)from, sizeof(*from));
 }
 
@@ -546,9 +568,10 @@ int main(int argc, char **argv)
 	time_t last_dump = 0, last_resolve = 0;
 	struct pollfd pfd;
 
-	while ((c = getopt(argc, argv, "p:c:s:t:i:S:T:P:")) != -1) {
+	while ((c = getopt(argc, argv, "p:c:s:t:i:S:T:P:N:")) != -1) {
 		switch (c) {
 		case 'S': scan_interval = atoi(optarg); break;
+		case 'N': hub_name = optarg; break;
 		case 'T': {
 			struct in_addr a;
 			if (inet_aton(optarg, &a) && nextra < 8)

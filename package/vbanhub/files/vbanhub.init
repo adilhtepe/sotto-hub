@@ -51,7 +51,7 @@ gen_mdns() {
 	local want="$1" port="$2" f=/etc/umdns/vbanhub.json new
 	[ -d /etc/umdns ] || return 0
 	if [ "$want" = 1 ]; then
-		new="{\"vbanhub\":{\"service\":\"_vban._udp.local\",\"port\":$port,\"txt\":[\"hub=1\"]}}"
+		new="{\"vbanhub\":{\"service\":\"_vban._udp.local\",\"port\":$port,\"txt\":[\"hub=1\",\"role=receiver,transmitter\"]}}"
 		[ "$(cat $f 2>/dev/null)" = "$new" ] || echo "$new" > $f
 	else
 		[ -f $f ] && rm -f $f || return 0
@@ -144,7 +144,7 @@ reload_service() {
 }
 
 start_service() {
-	local enabled port dscp mdns iface scan_interval scan_ports openfw
+	local enabled port dscp mdns iface scan_interval scan_ports openfw hub_name
 	config_load vbanhub
 	config_get_bool enabled main enabled 0
 	config_get port main port 6980
@@ -182,6 +182,9 @@ start_service() {
 			[ "$NETS_ADDED" = 1 ] || procd_append_param command -i none
 		fi
 	fi
+	config_get hub_name main hub_name
+	[ -n "$hub_name" ] || hub_name="$(cat /proc/sys/kernel/hostname 2>/dev/null) VBAN hub"
+	procd_append_param command -N "$hub_name"
 	config_get scan_interval main scan_interval 0
 	config_get scan_ports main scan_ports 6980
 	case "$scan_interval" in *[!0-9]*|'') scan_interval=0 ;; esac

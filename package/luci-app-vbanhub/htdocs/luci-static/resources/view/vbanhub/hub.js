@@ -259,6 +259,9 @@ return view.extend({
 		o = s.option(widgets.NetworkSelect, 'network', _('Listen on networks'),
 			_('The hub only accepts packets arriving on these networks; everything else is dropped. Do not select WAN.'));
 		o.multiple = true; o.nocreate = true; o.rmempty = false; o.default = 'lan';
+		o = s.option(form.Value, 'hub_name', _('Name shown to VBAN apps'),
+			_('The hub answers VBAN pings as a receiver and transmitter with this name, so apps that stream list it as a destination.'));
+		o.placeholder = _('<hostname> VBAN hub'); o.datatype = 'maxlength(63)';
 		o = s.option(form.Flag, 'open_firewall', _('Open UDP port in firewall'),
 			_('Adds an accept rule for the port in the firewall zones of the selected networks (never WAN). Zones that already accept input, like the default LAN, need none.'));
 		o.default = '1';

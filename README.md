@@ -27,7 +27,7 @@ The daemon route file is now TAB-separated (`route<TAB>ip<TAB>stream<TAB>ip<TAB>
 ## Boot, port and pings
 - The init script is **enabled at boot** (`deploy.sh` / package postinst); whether it actually runs is decided by the UCI `enabled` flag.
 - **UDP port in the firewall**: for each selected network the hub opens its port in that network's firewall zone with a managed rule `vbanhub_<zone>` (`open_firewall`, default on). Zones that already ACCEPT input (default `lan`) need none; `wan` and masquerading zones are never opened. Rules are only rewritten when they change and are removed when the hub is disabled.
-- **Pings**: full VBAN PING0 requests (header + 676-byte struct) get a reply (device `OpenWrt VBAN hub`, app `vbanhub`, type SERVER). `test/ping_hub.py <ip>` checks it.
+- **Pings / how apps see the hub**: any VBAN PING0 (unicast or broadcast, full or header-only; limit 20 replies/s) is answered as a SPOT receiver *and* SPOT transmitter (`bitType` 0xF), preferred rate 48 kHz, supported rates 6 kHz-705.6 kHz, with the name from `hub_name` (default `<hostname> VBAN hub`), manufacturer `OpenWrt`, application `vbanhub`, and the request's stream-name label echoed. Apps that list receivers can therefore offer the hub as a destination; point them at the router IP, port 6980, and any stream name. `test/ping_hub.py <ip>` checks it.
 
 ## Devices and interfaces in LuCI
 - **Listen on networks**: multi-select of your OpenWrt networks (lan, guest, ...).
