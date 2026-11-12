@@ -1,6 +1,8 @@
 #!/bin/sh /etc/rc.common
 
 USE_PROCD=1
+EXTRA_COMMANDS="scan"
+EXTRA_HELP="	scan	Scan the LAN for VBAN devices (PING0)"
 START=60
 STOP=10
 
@@ -47,6 +49,14 @@ gen_mdns() {
 	return 0
 }
 
+scan() {
+	procd_send_signal vbanhub '*' USR1
+}
+
+append_target() {
+	procd_append_param command -T "$1"
+}
+
 service_triggers() {
 	procd_add_reload_trigger vbanhub
 }
@@ -58,7 +68,7 @@ reload_service() {
 }
 
 start_service() {
-	local enabled port dscp mdns iface
+	local enabled port dscp mdns iface scan_interval scan_ports
 	config_load vbanhub
 	config_get_bool enabled main enabled 0
 	config_get port main port 6980
@@ -84,6 +94,12 @@ start_service() {
 	chmod 644 $CONF
 
 	procd_set_param command /usr/sbin/vbanhub -p "$port" -t "$dscp" -i "$iface" -c $CONF -s /var/run/vbanhub/status.json
+	config_get scan_interval main scan_interval 0
+	config_get scan_ports main scan_ports 6980
+	case "$scan_interval" in *[!0-9]*|'') scan_interval=0 ;; esac
+	case "$scan_ports" in *[!0-9,]*|'') scan_ports=6980 ;; esac
+	procd_append_param command -S "$scan_interval" -P "$scan_ports"
+	config_list_foreach main scan_target append_target
 	procd_set_param user nobody
 	procd_set_param respawn
 	procd_set_param limits nofile=64

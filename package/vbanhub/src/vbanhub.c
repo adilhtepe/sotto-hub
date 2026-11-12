@@ -17,6 +17,8 @@
 #include <arpa/inet.h>
 #include <endian.h>
 #include <errno.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
@@ -61,7 +63,7 @@ static int nroutes;
 static struct learned learn[MAX_LEARN];
 static int nlearn;
 static uint64_t st_rx, st_bad, st_unknown, st_tx, st_txerr;
-static volatile sig_atomic_t want_reload, want_quit;
+static volatile sig_atomic_t want_reload, want_quit, want_scan;
 static const char *cfg_path = "/var/etc/vbanhub.conf";
 static const char *stat_path = "/var/run/vbanhub/status.json";
 static const char *iface;       /* SO_BINDTODEVICE; NULL = all interfaces */
@@ -72,6 +74,8 @@ static void on_sig(int s)
 {
 	if (s == SIGHUP)
 		want_reload = 1;
+	else if (s == SIGUSR1)
+		want_scan = 1;
 	else
 		want_quit = 1;
 }
@@ -164,6 +168,184 @@ hit:
 	learn[i].last_seen = now;
 }
 
+
+/* ---- LAN discovery via VBAN PING0 (service identification), spec rev 13 ----
+ * Request/reply = 28-byte header (sub-protocol 0x60, nbc=0 service, nbs=0 ping /
+ * 0x80 reply, frame counter = request id) + 676-byte tagVBAN_PING0 struct. */
+#define SVC_LEN 676
+#define SVC_PKT (VBAN_HDR + SVC_LEN)
+#define MAX_DISC 64
+#define MAX_DEST 24
+#define MAX_PORTS 8
+#define PING_TYPE_SERVER 0x01000000u
+
+struct disc {
+	uint32_t ip;
+	uint16_t port;           /* host order, reply source port */
+	uint32_t type, feat;
+	char device[64], app[64], host[64], user[64];
+	time_t last_seen;
+};
+
+static struct disc disc[MAX_DISC];
+static int ndisc;
+static uint32_t scan_id;
+static time_t scan_until, last_scan, scan_interval;
+static uint32_t extra_dest[8];
+static int nextra;
+static int scan_ports[MAX_PORTS] = { 6980 };
+static int nports = 1;
+static uint32_t local_ip[16], bcast_ip[8];
+static int nlocal, nbcast;
+
+static int is_local(uint32_t ip)
+{
+	int i;
+	for (i = 0; i < nlocal; i++)
+		if (local_ip[i] == ip)
+			return 1;
+	return 0;
+}
+
+static void refresh_ifaces(void)
+{
+	struct ifaddrs *ifa, *q;
+
+	nlocal = nbcast = 0;
+	if (getifaddrs(&ifa))
+		return;
+	for (q = ifa; q; q = q->ifa_next) {
+		if (!q->ifa_addr || q->ifa_addr->sa_family != AF_INET)
+			continue;
+		if (nlocal < 16)
+			local_ip[nlocal++] = ((struct sockaddr_in *)q->ifa_addr)->sin_addr.s_addr;
+		if ((q->ifa_flags & IFF_BROADCAST) && q->ifa_broadaddr && nbcast < 8 &&
+		    (!iface || !strcmp(q->ifa_name, iface)))
+			bcast_ip[nbcast++] = ((struct sockaddr_in *)q->ifa_broadaddr)->sin_addr.s_addr;
+	}
+	freeifaddrs(ifa);
+}
+
+static void fill_ping(uint8_t *pkt, int reply, uint32_t fc)
+{
+	uint8_t *d = pkt + VBAN_HDR;
+	uint32_t v;
+
+	memset(pkt, 0, SVC_PKT);
+	memcpy(pkt, "VBAN", 4);
+	pkt[4] = 0x60;                 /* SERVICE */
+	pkt[5] = reply ? 0x80 : 0;     /* function PING0 (+ reply bit) */
+	pkt[6] = 0;                    /* service IDENTIFICATION */
+	memcpy(pkt + 8, "VBANHUB PING", 12);
+	v = htole32(fc);
+	memcpy(pkt + 24, &v, 4);
+	v = htole32(PING_TYPE_SERVER);
+	memcpy(d, &v, 4);
+	v = htole32(0x00000001u | 0x00000100u | 0x00010000u); /* audio, serial, text */
+	memcpy(d + 4, &v, 4);
+	d[29] = 1;                                              /* nVersion 0.1.0.0 */
+	strncpy((char *)d + 164, "OpenWrt VBAN hub", 63);       /* DeviceName */
+	strncpy((char *)d + 292, "vbanhub", 63);                /* ApplicationName */
+	gethostname((char *)d + 356, 63);                       /* HostName */
+}
+
+static void send_scan(int fd)
+{
+	uint8_t pkt[SVC_PKT];
+	uint32_t dest[MAX_DEST];
+	struct sockaddr_in to = { .sin_family = AF_INET };
+	int nd = 0, i, j;
+	time_t now = time(NULL);
+
+	refresh_ifaces();
+	dest[nd++] = htonl(INADDR_BROADCAST);
+	for (i = 0; i < nbcast && nd < MAX_DEST; i++)
+		dest[nd++] = bcast_ip[i];
+	for (i = 0; i < nextra && nd < MAX_DEST; i++)
+		dest[nd++] = extra_dest[i];
+	scan_id = scan_id ? scan_id + 1 : (uint32_t)now;
+	scan_until = now + 5;
+	last_scan = now;
+	fill_ping(pkt, 0, scan_id);
+	for (i = 0; i < nd; i++)
+		for (j = 0; j < nports; j++) {
+			to.sin_addr.s_addr = dest[i];
+			to.sin_port = htons(scan_ports[j]);
+			sendto(fd, pkt, sizeof(pkt), MSG_DONTWAIT, (struct sockaddr *)&to, sizeof(to));
+		}
+}
+
+static void copy_str(char *dst, const uint8_t *src, size_t n)
+{
+	size_t i;
+	for (i = 0; i < n - 1 && src[i]; i++)
+		dst[i] = (src[i] >= 32 && src[i] < 127) ? src[i] : '?';
+	dst[i] = 0;
+}
+
+static void record_disc(const struct sockaddr_in *from, const uint8_t *d, time_t now)
+{
+	int i, o = 0;
+	uint32_t v;
+
+	for (i = 0; i < ndisc; i++)
+		if (disc[i].ip == from->sin_addr.s_addr && disc[i].port == ntohs(from->sin_port))
+			goto fill;
+	if (ndisc < MAX_DISC) {
+		i = ndisc++;
+	} else {
+		for (i = 1; i < MAX_DISC; i++)
+			if (disc[i].last_seen < disc[o].last_seen)
+				o = i;
+		i = o;
+	}
+fill:
+	memset(&disc[i], 0, sizeof(disc[i]));
+	disc[i].ip = from->sin_addr.s_addr;
+	disc[i].port = ntohs(from->sin_port);
+	memcpy(&v, d, 4);
+	disc[i].type = le32toh(v);
+	memcpy(&v, d + 4, 4);
+	disc[i].feat = le32toh(v);
+	copy_str(disc[i].device, d + 164, sizeof(disc[i].device));
+	copy_str(disc[i].app, d + 292, sizeof(disc[i].app));
+	copy_str(disc[i].host, d + 356, sizeof(disc[i].host));
+	copy_str(disc[i].user, d + 420, sizeof(disc[i].user));
+	disc[i].last_seen = now;
+}
+
+static void handle_service(int fd, const uint8_t *p, unsigned len, const struct sockaddr_in *from, time_t now)
+{
+	static time_t rl_sec;
+	static int rl_cnt;
+	uint8_t rep[SVC_PKT];
+	uint32_t fc;
+
+	/* Only full PING0 packets (header + struct); anything shorter is ignored,
+	 * which also keeps replies from ever being larger than the request. */
+	if (p[6] != 0 || (p[5] & 0x7f) != 0 || len < SVC_PKT)
+		return;
+	memcpy(&fc, p + 24, 4);
+	fc = le32toh(fc);
+	if (p[5] & 0x80) {                      /* reply to our scan */
+		if (fc != scan_id || now > scan_until)
+			return;
+		record_disc(from, p + VBAN_HDR, now);
+		return;
+	}
+	/* request: ignore our own looped-back broadcast, rate-limit replies */
+	if (is_local(from->sin_addr.s_addr) && ntohs(from->sin_port) == listen_port)
+		return;
+	if (rl_sec != now) {
+		rl_sec = now;
+		rl_cnt = 0;
+	}
+	if (++rl_cnt > 20)
+		return;
+	fill_ping(rep, 1, fc);
+	sendto(fd, rep, sizeof(rep), MSG_DONTWAIT, (const struct sockaddr *)from, sizeof(*from));
+}
+
 static void json_name(FILE *f, const char *n, int len)
 {
 	int i;
@@ -217,7 +399,22 @@ static void dump_status(void)
 			learn[i].sr, learn[i].nbs, learn[i].nbc, learn[i].bit,
 			(unsigned long long)learn[i].pkts, (long)(now - learn[i].last_seen));
 	}
-	fputs("]}\n", f);
+	fputs("],\"discovered\":[", f);
+	for (i = 0; i < ndisc; i++) {
+		struct in_addr a = { disc[i].ip };
+		fprintf(f, "%s{\"ip\":\"%s\",\"port\":%u,\"type\":%u,\"feat\":%u,\"device\":",
+			i ? "," : "", inet_ntoa(a), disc[i].port, disc[i].type, disc[i].feat);
+		json_name(f, disc[i].device, 64);
+		fputs(",\"app\":", f);
+		json_name(f, disc[i].app, 64);
+		fputs(",\"host\":", f);
+		json_name(f, disc[i].host, 64);
+		fputs(",\"user\":", f);
+		json_name(f, disc[i].user, 64);
+		fprintf(f, ",\"age\":%ld}", (long)(now - disc[i].last_seen));
+	}
+	fprintf(f, "],\"scan\":{\"active\":%d,\"age\":%ld}}\n", now <= scan_until && last_scan,
+		last_scan ? (long)(now - last_scan) : -1L);
 	fclose(f);
 	rename(tmp, stat_path);
 }
@@ -234,8 +431,27 @@ int main(int argc, char **argv)
 	time_t last_dump = 0;
 	struct pollfd pfd;
 
-	while ((c = getopt(argc, argv, "p:c:s:t:i:")) != -1) {
+	while ((c = getopt(argc, argv, "p:c:s:t:i:S:T:P:")) != -1) {
 		switch (c) {
+		case 'S': scan_interval = atoi(optarg); break;
+		case 'T': {
+			struct in_addr a;
+			if (inet_aton(optarg, &a) && nextra < 8)
+				extra_dest[nextra++] = a.s_addr;
+			break;
+		}
+		case 'P': {
+			char *tok, *sv;
+			nports = 0;
+			for (tok = strtok_r(optarg, ",", &sv); tok && nports < MAX_PORTS; tok = strtok_r(NULL, ",", &sv))
+				if (atoi(tok) > 0 && atoi(tok) < 65536)
+					scan_ports[nports++] = atoi(tok);
+			if (!nports) {
+				nports = 1;
+				scan_ports[0] = 6980;
+			}
+			break;
+		}
 		case 'i': iface = strcmp(optarg, "*") ? optarg : NULL; break;
 		case 'p': port = atoi(optarg); break;
 		case 'c': cfg_path = optarg; break;
@@ -247,6 +463,7 @@ int main(int argc, char **argv)
 		}
 	}
 	sigaction(SIGHUP, &sa, NULL);
+	sigaction(SIGUSR1, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
 	sigaction(SIGINT, &sa, NULL);
 
@@ -259,6 +476,7 @@ int main(int argc, char **argv)
 	setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
 	setsockopt(fd, SOL_SOCKET, SO_PRIORITY, &prio, sizeof(prio));
 	listen_port = port;
+	setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &(int){ 1 }, sizeof(int));
 	if (iface && setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, iface, strlen(iface) + 1)) {
 		perror("SO_BINDTODEVICE"); /* fail closed: never fall back to all interfaces */
 		return 1;
@@ -270,6 +488,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	started = time(NULL);
+	refresh_ifaces();
 	if (load_config() < 0)
 		fprintf(stderr, "vbanhub: cannot read %s, starting with no routes\n", cfg_path);
 	pfd.fd = fd;
@@ -283,6 +502,9 @@ int main(int argc, char **argv)
 			want_reload = 0;
 			load_config();
 		}
+		if ((want_scan && now - last_scan >= 3) || (scan_interval && now - last_scan >= scan_interval))
+			send_scan(fd);
+		want_scan = 0;
 		if (now - last_dump >= 2) {
 			dump_status();
 			last_dump = now;
@@ -310,6 +532,10 @@ int main(int argc, char **argv)
 			if ((rx[i].msg_hdr.msg_flags & MSG_TRUNC) || len < VBAN_HDR ||
 			    memcmp(p, "VBAN", 4)) {
 				st_bad++;
+				continue;
+			}
+			if ((p[4] & 0xE0) == 0x60) {      /* SERVICE: handled by the hub, never routed */
+				handle_service(fd, p, len, &addrs[i], now);
 				continue;
 			}
 			memcpy(&fc, p + 24, 4);

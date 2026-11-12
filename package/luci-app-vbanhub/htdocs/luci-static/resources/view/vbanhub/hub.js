@@ -15,6 +15,14 @@ function readStatus() {
 	});
 }
 
+var TYPES = [ [1, 'receiver'], [2, 'transmitter'], [4, 'receiver (spot)'], [8, 'transmitter (spot)'],
+	[0x10, 'virtual device'], [0x20, 'virtual mixer'], [0x40, 'matrix'], [0x80, 'DAW'], [0x01000000, 'server'] ];
+
+function typeLabel(t) {
+	var l = TYPES.filter(function(x) { return t & x[0]; }).map(function(x) { return x[1]; });
+	return l.length ? l.join(', ') : '-';
+}
+
 function ago(s) { return s < 0 ? '-' : s + 's ago'; }
 
 return view.extend({
@@ -97,7 +105,48 @@ return view.extend({
 				.concat(rows.length ? rows : [ E('tr', {}, E('td', { 'class': 'td', 'colspan': titles.length }, E('em', empty))) ]));
 		}
 
+		var eps = uci.sections('vbanhub', 'endpoint');
+		function have(ip, role) { return eps.some(function(e) { return e.ip === ip && e.role === role; }); }
+		function addEp(d, role) {
+			var hit = (st.learned || []).filter(function(l) { return l.ip === d.ip && !/\s/.test(l.stream); })[0];
+			var id = uci.add('vbanhub', 'endpoint');
+			uci.set('vbanhub', id, 'name', (d.host || d.device || d.ip) + (role === 'rx' ? ' (rx)' : ' (tx)'));
+			uci.set('vbanhub', id, 'role', role);
+			uci.set('vbanhub', id, 'ip', d.ip);
+			if (role === 'rx') uci.set('vbanhub', id, 'port', String(d.port));
+			/* PING0 does not carry stream names: use the one heard from this IP, else a placeholder to edit */
+			uci.set('vbanhub', id, 'stream', (role === 'tx' && hit) ? hit.stream : 'Stream1');
+			uci.save().then(function() { location.reload(); });
+		}
+		var found = (st.discovered || []).map(function(d) {
+			var rx = d.type & 0x5, tx = d.type & 0xA, any = !rx && !tx, btns = [];
+			function btn(role, label) {
+				return have(d.ip, role) ? E('em', {}, _('already added') + ' ') :
+					E('button', { 'class': 'cbi-button cbi-button-add', 'click': function() { addEp(d, role); } }, label);
+			}
+			if (rx || any) btns.push(btn('rx', _('Add as receiver')));
+			if (tx || any) btns.push(btn('tx', _('Add as transmitter')));
+			return E('tr', { 'class': 'tr' }, [
+				E('td', { 'class': 'td' }, d.ip + ':' + d.port),
+				E('td', { 'class': 'td' }, d.host || '-'),
+				E('td', { 'class': 'td' }, [ d.app, d.device ].filter(Boolean).join(' / ') || '-'),
+				E('td', { 'class': 'td' }, typeLabel(d.type)),
+				E('td', { 'class': 'td' }, btns)
+			]);
+		});
+		var scanning = st.scan && st.scan.active;
+
 		return E('div', {}, [
+			E('h4', {}, _('Discovered devices')),
+			E('p', {}, [
+				E('button', { 'class': 'cbi-button cbi-button-action', 'click': function() {
+					return fs.exec('/etc/init.d/vbanhub', [ 'scan' ]).catch(function(e) { ui.addNotification(null, E('p', e.message)); });
+				} }, _('Scan LAN')),
+				' ', scanning ? _('Scanning…') : (st.scan && st.scan.age >= 0 ? _('Last scan %ds ago').format(st.scan.age) : '')
+			]),
+			tbl([ _('Address'), _('Host'), _('Application / device'), _('Type'), '' ], found,
+				_('Nothing found yet. Start the service and press Scan LAN. Devices must answer VBAN PING (Voicemeeter, VBAN apps do).')),
+			E('p', { 'class': 'cbi-section-descr' }, _('Stream names are not part of discovery: receivers get the placeholder "Stream1" (edit it to the name the device expects); transmitters use the name heard in "Unrouted senders" if available.')),
 			E('p', {}, _('Received: %d, forwarded: %d, send errors: %d, malformed: %d, unrouted: %d')
 				.format(st.rx || 0, st.tx || 0, st.txerr || 0, st.bad || 0, st.unknown || 0)),
 			E('h4', {}, _('Active routes')),
@@ -122,6 +171,12 @@ return view.extend({
 		o = s.option(form.Value, 'dscp', _('DSCP'), _('46 = EF (WMM voice queue on Wi-Fi).'));
 		o.datatype = 'range(0,63)'; o.placeholder = '46';
 
+		o = s.option(form.Value, 'scan_interval', _('Auto-scan interval (s)'), _('0 = only when you press Scan LAN.'));
+		o.datatype = 'uinteger'; o.placeholder = '0';
+		o = s.option(form.Value, 'scan_ports', _('Scan ports'), _('Comma-separated UDP ports devices listen on.'));
+		o.placeholder = '6980';
+		o = s.option(form.DynamicList, 'scan_target', _('Extra scan targets'), _('Unicast pings for hosts that do not receive broadcasts (other subnets, Wi-Fi isolation).'));
+		o.datatype = 'ip4addr';
 		o = s.option(form.Flag, 'mdns', _('Announce via mDNS'), _('Publishes _vban._udp (needs the umdns package).'));
 		o.default = '1';
 

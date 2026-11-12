@@ -13,6 +13,18 @@ VBAN is plain UDP with no handshake, auth or encryption, and existing clients
 3. **Binding**: a route only matches `(source IP, stream name)`; everything else is
    dropped and shown as "unrouted". For untrusted networks tunnel via WireGuard.
 
+## LAN discovery (VBAN PING0)
+The hub can find receivers and transmitters on the LAN using VB-Audio's service/identification ping
+(spec rev 13: header sub-protocol 0x60 + 676-byte `tagVBAN_PING0`). Press **Scan LAN** in LuCI (or
+`/etc/init.d/vbanhub scan`, or set `scan_interval`). It broadcasts to 255.255.255.255 and the LAN
+broadcast address on `scan_ports` (default 6980), plus unicast `scan_target`s for hosts that do not
+see broadcasts. Replies must echo the request id and arrive within 5 s, so spoofed unsolicited replies are
+ignored. Replies show IP:port, host, application, and type (receiver/transmitter/...), with one-click
+**Add as receiver / transmitter**. The hub also answers pings from others (full packets only, 20/s max).
+Limits: PING0 does not carry stream names, so receivers get a placeholder `Stream1` to edit; transmitters
+reuse the stream name heard in "Unrouted senders" when available. Only devices that implement PING answer.
+Test: `test/test_discovery.py <binary>`; demo device: `test/fake_endpoint.py`.
+
 ## Layout
 - `package/vbanhub/` daemon (C, ~8 KB text, ~50 KB static BSS), UCI config, procd init
 - `package/luci-app-vbanhub/` LuCI JS view, menu + ACL
