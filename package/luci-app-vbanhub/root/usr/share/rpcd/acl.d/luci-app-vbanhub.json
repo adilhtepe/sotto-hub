@@ -1,0 +1,12 @@
+{
+	"luci-app-vbanhub": {
+		"description": "Grant access to VBAN Hub",
+		"read": {
+			"file": { "/var/run/vbanhub/status.json": [ "read" ] },
+			"uci": [ "vbanhub" ]
+		},
+		"write": {
+			"uci": [ "vbanhub" ]
+		}
+	}
+}

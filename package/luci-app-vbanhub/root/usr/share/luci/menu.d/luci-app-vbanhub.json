@@ -1,0 +1,8 @@
+{
+	"admin/services/vbanhub": {
+		"title": "VBAN Hub",
+		"order": 60,
+		"action": { "type": "view", "path": "vbanhub/hub" },
+		"depends": { "acl": [ "luci-app-vbanhub" ], "uci": { "vbanhub": true } }
+	}
+}

@@ -1,0 +1,91 @@
+#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+START=60
+STOP=10
+
+CONF=/var/etc/vbanhub.conf
+
+gen_route() {
+	local from to sip sstream dip dport dstream en
+	config_get_bool en "$1" enabled 1
+	[ "$en" = 1 ] || return 0
+	config_get from "$1" from
+	config_get to "$1" to
+	[ -n "$from" ] && [ -n "$to" ] || return 0
+	# No wildcard source: a route must be bound to a transmitter IP and stream.
+	config_get sip "$from" ip
+	config_get sstream "$from" stream
+	config_get dip "$to" ip
+	config_get dport "$to" port 6980
+	config_get dstream "$to" stream
+	[ -n "$sip" ] && [ -n "$sstream" ] && [ -n "$dip" ] && [ -n "$dstream" ] || return 0
+	# Config is whitespace-delimited: reject names that would shift fields.
+	case "$sip$sstream$dip$dport$dstream" in
+		*[[:space:]]*|*'*'*) logger -t vbanhub "route $1 skipped: invalid characters"; return 0 ;;
+	esac
+	echo "route $sip $sstream $dip $dport $dstream" >> $CONF
+}
+
+gen_conf() {
+	mkdir -p /var/etc
+	echo "# generated from /etc/config/vbanhub" > $CONF
+	config_foreach gen_route route
+}
+
+# Announce the hub via umdns (_vban._udp). Written to flash only when changed.
+gen_mdns() {
+	local want="$1" port="$2" f=/etc/umdns/vbanhub.json new
+	[ -d /etc/umdns ] || return 0
+	if [ "$want" = 1 ]; then
+		new="{\"vbanhub\":{\"service\":\"_vban._udp.local\",\"port\":$port,\"txt\":[\"hub=1\"]}}"
+		[ "$(cat $f 2>/dev/null)" = "$new" ] || echo "$new" > $f
+	else
+		[ -f $f ] && rm -f $f || return 0
+	fi
+	ubus -t 1 call umdns reload 2>/dev/null
+	return 0
+}
+
+service_triggers() {
+	procd_add_reload_trigger vbanhub
+}
+
+reload_service() {
+	config_load vbanhub
+	gen_conf
+	procd_send_signal vbanhub   # SIGHUP: reload routes, no packet loss
+}
+
+start_service() {
+	local enabled port dscp mdns iface
+	config_load vbanhub
+	config_get_bool enabled main enabled 0
+	config_get port main port 6980
+	config_get dscp main dscp 46
+	config_get_bool mdns main mdns 1
+	if [ "$enabled" != 1 ]; then
+		gen_mdns 0 "$port"
+		return 0
+	fi
+	gen_conf
+	gen_mdns "$mdns" "$port"
+
+	procd_open_instance
+	# Bind to one interface (default: the LAN device) so the WAN never reaches it.
+	config_get iface main iface
+	[ -n "$iface" ] || iface="$(uci -q get network.lan.device)"
+	[ -n "$iface" ] || iface=br-lan
+
+	# Unprivileged: runs as nobody; only the state dir is writable.
+	mkdir -p /var/run/vbanhub
+	chown nobody:nogroup /var/run/vbanhub 2>/dev/null || chown nobody /var/run/vbanhub
+	chmod 755 /var/run/vbanhub
+	chmod 644 $CONF
+
+	procd_set_param command /usr/sbin/vbanhub -p "$port" -t "$dscp" -i "$iface" -c $CONF -s /var/run/vbanhub/status.json
+	procd_set_param user nobody
+	procd_set_param respawn
+	procd_set_param limits nofile=64
+	procd_close_instance
+}
