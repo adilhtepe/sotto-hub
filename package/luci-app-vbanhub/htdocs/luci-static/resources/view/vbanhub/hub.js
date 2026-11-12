@@ -181,6 +181,93 @@ return view.extend({
 		return E('table', { 'class': 'table' }, [ E('tr', { 'class': 'tr table-titles' }, head) ].concat(rows));
 	},
 
+	/* Tab 1: inputs (transmitters) and outputs (receivers), each with its own live state and volume.
+	 * Built once; the poll only updates the live cells so a slider being dragged is never rebuilt. */
+	renderMixer: function(st) {
+		var live = this.mixLive = [];
+		var eps = uci.sections('vbanhub', 'endpoint');
+		var routes = uci.sections('vbanhub', 'route').filter(function(r) { return r.enabled !== '0'; });
+
+		function nameOf(id) { var e = uci.get('vbanhub', id); return e ? (e.name || e.ip || id) : id; }
+		function dot(on) {
+			return E('span', { 'style': 'color:' + (on ? '#3fb950' : '#8b949e') + ';font-size:1.3em;vertical-align:middle' }, '●');
+		}
+		function liveCell(f) {
+			var el = E('span');
+			function draw(s) {
+				var r = f(s || {});
+				el.innerHTML = '';
+				el.appendChild(dot(r.on));
+				el.appendChild(document.createTextNode(' ' + r.text));
+			}
+			draw(st);
+			live.push(draw);
+			return el;
+		}
+		function links(e, field, other) {
+			var l = routes.filter(function(r) { return r[field] === e['.name']; }).map(function(r) { return nameOf(r[other]); });
+			return l.length ? l.join(', ') : '-';
+		}
+		function tbl(titles, rows, empty) {
+			return E('table', { 'class': 'table' }, [ E('tr', { 'class': 'tr table-titles' }, titles.map(function(t) { return E('th', { 'class': 'th' }, t); })) ]
+				.concat(rows.length ? rows : [ E('tr', {}, E('td', { 'class': 'td', 'colspan': titles.length }, E('em', empty))) ]));
+		}
+
+		var inputs = eps.filter(function(e) { return e.role !== 'rx'; }).map(function(e) {
+			return E('tr', { 'class': 'tr' }, [
+				E('td', { 'class': 'td' }, E('strong', {}, e.name || e.ip)),
+				E('td', { 'class': 'td' }, e.ip),
+				E('td', { 'class': 'td' }, e.stream || '-'),
+				E('td', { 'class': 'td' }, liveCell(function(s) {
+					var h = (s.streams || []).filter(function(x) { return x.ip === e.ip && x.stream === e.stream; })[0];
+					if (!h) return { on: false, text: _('no signal') };
+					var on = h.age <= 3;
+					return { on: on, text: streamFormat(h) + (on ? ' · ' + _('%d pkt/s').format(h.rate) : ' · ' + ago(h.age)) };
+				})),
+				E('td', { 'class': 'td' }, links(e, 'from', 'to')),
+				E('td', { 'class': 'td' }, volumeWidget(e['.name']))
+			]);
+		});
+
+		var outputs = eps.filter(function(e) { return e.role === 'rx'; }).map(function(e) {
+			var port = +(e.port || 6980);
+			return E('tr', { 'class': 'tr' }, [
+				E('td', { 'class': 'td' }, E('strong', {}, e.name || e.ip)),
+				E('td', { 'class': 'td' }, e.ip + ':' + port),
+				E('td', { 'class': 'td' }, e.stream || '-'),
+				E('td', { 'class': 'td' }, liveCell(function(s) {
+					var rs = (s.routes || []).filter(function(r) { return r.dst === e.ip && r.dst_port === port && r.dst_stream === e.stream; });
+					var ages = rs.map(function(r) { return r.age; }).filter(function(a) { return a >= 0; });
+					var on = ages.some(function(a) { return a <= 3; });
+					if (!rs.length) return { on: false, text: _('no input routed') };
+					return { on: on, text: on ? _('receiving') : (ages.length ? _('idle, last %s').format(ago(Math.min.apply(null, ages))) : _('no data yet')) };
+				})),
+				E('td', { 'class': 'td' }, links(e, 'to', 'from')),
+				E('td', { 'class': 'td' }, volumeWidget(e['.name']))
+			]);
+		});
+
+		return E('div', {}, [
+			E('h3', {}, _('Master volume')),
+			E('div', { 'class': 'cbi-section-descr' }, _('Applied to every output on top of the input and output volumes.')),
+			volumeWidget('main'),
+			E('h3', { 'style': 'margin-top:1.5em' }, _('Inputs')),
+			E('div', { 'class': 'cbi-section-descr' }, _('Transmitters sending to the hub. The volume is applied to everything this input sends.')),
+			tbl([ _('Name'), _('Address'), _('Stream name'), _('Signal'), _('Sends to'), _('Volume') ], inputs,
+				_('No inputs yet. Add transmitters in the Settings tab.')),
+			E('h3', { 'style': 'margin-top:1.5em' }, _('Outputs')),
+			E('div', { 'class': 'cbi-section-descr' }, _('Receivers the hub sends to. The volume is applied to everything this output receives.')),
+			tbl([ _('Name'), _('Address'), _('Stream name'), _('State'), _('Receives from'), _('Volume') ], outputs,
+				_('No outputs yet. Add receivers in the Settings tab.'))
+		]);
+	},
+
+	updateMixer: function(st) {
+		(this.mixLive || []).forEach(function(draw) { draw(st); });
+		if (this.mixBanner)
+			this.mixBanner.style.display = Object.keys(st).length ? 'none' : '';
+	},
+
 	renderStatus: function(st) {
 		var self = this;
 		var routes = (st.routes || []).map(function(r) {
@@ -304,14 +391,12 @@ return view.extend({
 		this.hints = data[2] || {};
 		var statusBox = E('div', { 'id': 'vbanhub-status' }, this.renderStatus(data[1]));
 
-		m = new form.Map('vbanhub', _('VBAN Hub'),
+		m = new form.Map('vbanhub', '',
 			_('Receives VBAN streams from transmitters and forwards them to selected receivers, rewriting the stream name. Point each transmitter at this router\'s IP and the hub port, using the stream name set below.'));
 
 		s = m.section(form.NamedSection, 'main', 'vbanhub', _('Settings'));
 		o = s.option(form.Flag, 'enabled', _('Enable'));
 		o.rmempty = false;
-		o = s.option(form.DummyValue, 'gain', _('Master volume'), _('Applied to every route on top of its own volume. Works for PCM audio (8/16/24/32-bit, float); other formats pass through unchanged.'));
-		o.renderWidget = function() { return volumeWidget('main'); };
 		o = s.option(form.Value, 'port', _('Listen port'));
 		o.datatype = 'port'; o.placeholder = '6980';
 		o = s.option(form.Value, 'dscp', _('DSCP'), _('46 = EF (WMM voice queue on Wi-Fi).'));
@@ -359,6 +444,7 @@ return view.extend({
 			pruneRoutes();
 			return this.map.save(null, true).then(function() {
 				if (self.matrixBox) { self.matrixBox.innerHTML = ''; self.matrixBox.appendChild(self.renderMatrix()); }
+				if (self.mixerBox) { self.mixerBox.innerHTML = ''; self.mixerBox.appendChild(self.renderMixer(self.lastSt || {})); }
 			});
 		};
 		o = s.option(form.Value, 'name', _('Name'));
@@ -379,8 +465,11 @@ return view.extend({
 		};
 
 		return m.render().then(function(mapNode) {
+			self.lastSt = data[1];
 			poll.add(function() {
 				return readStatus().then(function(st) {
+					self.lastSt = st;
+					self.updateMixer(st);
 					var box = document.getElementById('vbanhub-status');
 					if (box) { box.innerHTML = ''; box.appendChild(self.renderStatus(st)); }
 				});
@@ -388,14 +477,24 @@ return view.extend({
 
 			self.map = m;
 			self.matrixBox = E('div', {}, self.renderMatrix());
-			return E([
-				mapNode,
-				E('h3', {}, _('Routing matrix')),
-				E('div', { 'class': 'cbi-section-descr' }, _('Tick a cell to send that transmitter to that receiver. Save endpoint changes before editing the matrix.')),
-				self.matrixBox,
-				E('h3', {}, _('Live status')),
-				statusBox
+			self.mixerBox = E('div', {}, self.renderMixer(data[1]));
+			self.mixBanner = E('div', { 'class': 'alert-message warning', 'style': Object.keys(data[1]).length ? 'display:none' : '' },
+				_('The VBAN hub is not running, so nothing is received or routed. Open the Settings tab, tick Enable and use Save & Apply (the service starts by itself).'));
+
+			var tabs = E('div', {}, [
+				E('div', { 'data-tab': 'mixer', 'data-tab-title': _('Mixer') }, [ self.mixBanner, self.mixerBox ]),
+				E('div', { 'data-tab': 'settings', 'data-tab-title': _('Settings') }, [
+					mapNode,
+					E('h3', {}, _('Routing matrix')),
+					E('div', { 'class': 'cbi-section-descr' }, _('Tick a cell to send that transmitter to that receiver. Save endpoint changes before editing the matrix.')),
+					self.matrixBox,
+					E('h3', {}, _('Live status')),
+					statusBox
+				])
 			]);
+			ui.tabs.initTabGroup(tabs.childNodes);
+
+			return E('div', {}, [ E('h2', {}, _('VBAN Hub')), tabs ]);
 		});
 	},
 

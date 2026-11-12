@@ -24,8 +24,12 @@ unicast streams between two other LAN hosts never reach the router's IP stack.
 The daemon route file is now TAB-separated (`route<TAB>ip<TAB>stream<TAB>ip<TAB>port<TAB>stream`) so names may contain spaces;
 `/etc/init.d/vbanhub` generates it. Test: `test/test_streams.py <binary>`.
 
+## LuCI page: two tabs
+- **Mixer** (first tab): only the *Inputs* (transmitters) and *Outputs* (receivers), each with its own live state (signal/format/pkt/s or receiving/idle), who it is routed to, and its own volume + mute slider; plus the master volume.
+- **Settings**: everything else (hub settings, routes, endpoints, routing matrix, devices on the router, discovery, streams heard, status).
+
 ## Volume
-Every route has a volume (0-200 %, default 100) and a mute switch, plus a master volume applied on top, all with sliders on the LuCI page (changes apply instantly, no restart, no dropped packets). It scales PCM audio in the hub: uint8, int16, int24, int32 (fixed point, saturating) and float32/64; serial/text, non-PCM codecs and 12/10-bit data pass through unchanged. At 100 % the packet is forwarded bit-exact without a copy; only scaled routes pay for a payload copy (up to 45 KB of static buffers). UCI: `option gain`/`mute` on a `route` section or on `main`. Test: `test/test_gain.py`.
+Volume exists per input, per output, per route and as a master; the effective level is their product (input x output x route x master; 0-150 % per slider, up to 400 % combined, any mute gives silence). Sliders apply instantly with `/etc/init.d/vbanhub setvol <main|route-id|endpoint-id> <0-200> <0|1>` (validated, committed, config re-read without restart or dropped packets). The hub scales PCM audio: uint8, int16, int24, int32 (fixed point, saturating) and float32/64; serial/text, non-PCM codecs and 12/10-bit data pass through unchanged. At 100 % a packet is forwarded bit-exact without a copy; only scaled routes pay for a payload copy (up to 45 KB of static buffers). UCI: `option gain`/`mute` on `route`, `endpoint` or `main` sections. Tests: `test/test_gain.py`, `node test/test_luci_render.js <hub.js>`.
 A device that announces itself with a full PING0 (like `~/vban/PC/vban-pc-tx.py`, every 10 s) is added to Discovered devices automatically, no scan needed.
 
 ## Housekeeping (automatic)

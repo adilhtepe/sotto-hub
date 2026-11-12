@@ -48,7 +48,7 @@ struct route {
 	uint32_t last_fc;
 	int have_fc;
 	time_t last_seen;
-	unsigned gain;       /* per-route volume in percent, 100 = unchanged, 0 = mute */
+	unsigned gain;       /* effective route volume in percent (route x input x output), 100 = unchanged, 0 = mute */
 };
 
 static unsigned master_gain = 100;   /* master volume in percent, applied on top of every route */
@@ -212,7 +212,7 @@ static int load_config(void)
 		r->gain = 100;
 		if (nf == 7) {
 			int g = atoi(fld[6]);
-			r->gain = g < 0 ? 0 : (g > 200 ? 200 : g);
+			r->gain = g < 0 ? 0 : (g > 400 ? 400 : g);   /* route x input x output */
 		}
 		n++;
 	}

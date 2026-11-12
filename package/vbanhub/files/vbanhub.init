@@ -6,11 +6,22 @@ USE_PROCD=1
 EXTRA_COMMANDS="scan prune setvol"
 EXTRA_HELP="	scan	Scan the LAN for VBAN devices (PING0)
 	prune	Delete routes whose endpoints no longer exist
-	setvol	<main|route-id> <0-200> <0|1>  Set volume percent and mute, applied instantly"
+	setvol	<main|route-id|endpoint-id> <0-200> <0|1>  Set volume percent and mute, applied instantly"
 START=60
 STOP=10
 
 CONF=/var/etc/vbanhub.conf
+
+# Volume of an endpoint (input or output) in percent: 0 when muted.
+ep_gain() {
+	local g m
+	config_get g "$1" gain 100
+	config_get_bool m "$1" mute 0
+	case "$g" in *[!0-9]*|'') g=100 ;; esac
+	[ "$g" -gt 200 ] && g=200
+	[ "$m" = 1 ] && g=0
+	echo "$g"
+}
 
 gen_route() {
 	local from to sip sstream dip dport dstream en gain mute
@@ -45,6 +56,9 @@ gen_route() {
 	case "$gain" in *[!0-9]*|'') gain=100 ;; esac
 	[ "$gain" -gt 200 ] && gain=200
 	[ "$mute" = 1 ] && gain=0
+	# effective volume = route x input x output (percent); the daemon accepts up to 400
+	gain=$((gain * $(ep_gain "$from") * $(ep_gain "$to") / 10000))
+	[ "$gain" -gt 400 ] && gain=400
 	printf 'route\t%s\t%s\t%s\t%s\t%s\t%s\n' "$sip" "$sstream" "$dip" "$dport" "$dstream" "$gain" >> $CONF
 }
 
@@ -183,7 +197,10 @@ setvol() {
 	case "$mute" in 0|1) ;; *) echo "bad mute" >&2; return 1 ;; esac
 	[ "$gain" -gt 200 ] && gain=200
 	if [ "$sec" != main ]; then
-		[ "$(uci -q get vbanhub.$sec)" = route ] || { echo "no such route (save the page first)" >&2; return 1; }
+		case "$(uci -q get vbanhub.$sec)" in
+			route|endpoint) ;;
+			*) echo "no such route/endpoint (save and apply the page first)" >&2; return 1 ;;
+		esac
 	fi
 	uci set vbanhub.$sec.gain="$gain"
 	uci set vbanhub.$sec.mute="$mute"

@@ -5,11 +5,12 @@ binp = sys.argv[1]; d = tempfile.mkdtemp(); conf, stat = f"{d}/c", f"{d}/s.json"
 rxs = {}
 def rx(name):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("127.0.0.1", 0)); s.settimeout(2); rxs[name] = s; return s.getsockname()[1]
-ports = {n: rx(n) for n in ("full", "half", "mute", "boost", "master")}
+ports = {n: rx(n) for n in ("full", "half", "mute", "boost", "x4", "master")}
 lines = [f"route\t127.0.0.1\tA\t127.0.0.1\t{ports['full']}\tfull\t100\n",
          f"route\t127.0.0.1\tA\t127.0.0.1\t{ports['half']}\thalf\t50\n",
          f"route\t127.0.0.1\tA\t127.0.0.1\t{ports['mute']}\tmute\t0\n",
          f"route\t127.0.0.1\tA\t127.0.0.1\t{ports['boost']}\tboost\t200\n",
+         f"route\t127.0.0.1\tA\t127.0.0.1\t{ports['x4']}\tx4\t400\n",   # route x input x output can reach 400 %
          f"route\t127.0.0.1\tA\t127.0.0.1\t{ports['master']}\tmaster\n"]       # no 7th field = 100 %
 open(conf, "w").write("".join(lines))
 p = subprocess.Popen([binp, "-p", str(HUB), "-c", conf, "-s", stat]); time.sleep(0.4)
@@ -34,6 +35,7 @@ get = lambda b: struct.unpack("<8h", b)
 check(get(o["full"]) == tuple(s16), "unity must be bit-exact")
 check(get(o["half"]) == tuple(int(x * 0.5) if x >= 0 else -int(-x * 0.5) for x in s16) or all(abs(a - b * 0.5) <= 1 for a, b in zip(get(o["half"]), s16)), f"half {get(o['half'])}")
 check(get(o["mute"]) == (0,) * 8, "mute")
+check(get(o["x4"])[0] == 4000 and get(o["x4"])[2] == 32767, f"gain 400 {get(o['x4'])}")
 check(get(o["boost"])[2] == 32767 and get(o["boost"])[3] == -32768 and get(o["boost"])[0] == 2000, f"boost saturates {get(o['boost'])}")
 # int24 (fmt 2), float32 (fmt 4), uint8 (fmt 0)
 v24 = [100000, -100000, 8000000, -8000000]
