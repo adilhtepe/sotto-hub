@@ -48,7 +48,10 @@ struct route {
 	uint32_t last_fc;
 	int have_fc;
 	time_t last_seen;
+	unsigned gain;       /* per-route volume in percent, 100 = unchanged, 0 = mute */
 };
+
+static unsigned master_gain = 100;   /* master volume in percent, applied on top of every route */
 
 /* Every VBAN stream heard (routed or not), keyed by (source ip, 16-byte stream name). */
 struct stream {
@@ -146,12 +149,15 @@ static int load_config(void)
 	char line[256];
 	int n = 0;
 
+	master_gain = 100;
+
 	if (!f)
 		return -1;
 	while (fgets(line, sizeof(line), f) && n < MAX_ROUTES) {
 		/* TAB-separated so stream names may contain spaces:
-		 * route \t src_ip|* \t src_stream|* \t dst_ip \t dst_port \t dst_stream */
-		char *fld[6], *t = line, *sip, *sname, *dip, *dname;
+		 * route \t src_ip|* \t src_stream|* \t dst_ip \t dst_port \t dst_stream [\t gain_percent]
+		 * master \t gain_percent */
+		char *fld[7], *t = line, *sip, *sname, *dip, *dname;
 		int dport, nf = 0;
 		struct route *r;
 		struct in_addr a;
@@ -159,14 +165,19 @@ static int load_config(void)
 		if (line[0] == '#')
 			continue;
 		line[strcspn(line, "\r\n")] = 0;
-		while (nf < 6) {
+		if (!strncmp(line, "master\t", 7)) {
+			int g = atoi(line + 7);
+			master_gain = g < 0 ? 0 : (g > 200 ? 200 : g);
+			continue;
+		}
+		while (nf < 7) {
 			fld[nf++] = t;
 			t = strchr(t, '\t');
 			if (!t)
 				break;
 			*t++ = 0;
 		}
-		if (nf != 6 || strcmp(fld[0], "route") || !fld[2][0] || !fld[5][0])
+		if ((nf != 6 && nf != 7) || strcmp(fld[0], "route") || !fld[2][0] || !fld[5][0])
 			continue;
 		sip = fld[1]; sname = fld[2]; dip = fld[3]; dname = fld[5];
 		dport = atoi(fld[4]);
@@ -198,6 +209,11 @@ static int load_config(void)
 		else
 			set_name(r->src_name, sname);
 		set_name(r->dst_name, dname);
+		r->gain = 100;
+		if (nf == 7) {
+			int g = atoi(fld[6]);
+			r->gain = g < 0 ? 0 : (g > 200 ? 200 : g);
+		}
 		n++;
 	}
 	fclose(f);
@@ -397,6 +413,8 @@ static void handle_service(int fd, const uint8_t *p, unsigned len, const struct 
 	/* request: ignore our own looped-back broadcast, rate-limit replies */
 	if (is_local(from->sin_addr.s_addr) && ntohs(from->sin_port) == listen_port)
 		return;
+	if (len >= SVC_PKT)   /* a device announcing itself with a full PING0: remember it, no scan needed */
+		record_disc(from, p + VBAN_HDR, now);
 	if (rl_sec != now) {
 		rl_sec = now;
 		rl_cnt = 0;
@@ -405,6 +423,81 @@ static void handle_service(int fd, const uint8_t *p, unsigned len, const struct 
 		return;
 	fill_ping(rep, 1, fc, p + 8);
 	sendto(fd, rep, sizeof(rep), MSG_DONTWAIT, (const struct sockaddr *)from, sizeof(*from));
+}
+
+/* Scale PCM samples of an audio packet by gain/100 into dst (a private copy of the payload).
+ * Supports uint8, int16, int24, int32, float32, float64 (VBAN little-endian); anything else
+ * (other sub-protocol, non-PCM codec, 12/10-bit) is left untouched and returns 0. Fixed point (Q14)
+ * for the integer formats so it is cheap on routers without an FPU; integer results saturate. */
+static int apply_gain(uint8_t *dst, const uint8_t *src, unsigned n, const uint8_t *h, unsigned gain)
+{
+	unsigned fmt = h[7] & 0x07, bps, cnt, i;
+	int64_t g = (int64_t)gain * 16384 / 100;
+
+	if ((h[4] & 0xE0) || (h[7] & 0xF0))
+		return 0;
+	switch (fmt) {
+	case 0: bps = 1; break;
+	case 1: bps = 2; break;
+	case 2: bps = 3; break;
+	case 3: case 4: bps = 4; break;
+	case 5: bps = 8; break;
+	default: return 0;
+	}
+	cnt = (unsigned)(h[5] + 1) * (unsigned)(h[6] + 1);
+	if (cnt * bps > n)
+		cnt = n / bps;
+	memcpy(dst, src, n);
+	for (i = 0; i < cnt; i++) {
+		uint8_t *b = dst + (size_t)i * bps;
+		int64_t v;
+
+		switch (fmt) {
+		case 0:
+			v = (((int64_t)b[0] - 128) * g) >> 14;
+			b[0] = (uint8_t)((v > 127 ? 127 : (v < -128 ? -128 : v)) + 128);
+			break;
+		case 1:
+			v = ((int64_t)(int16_t)(b[0] | b[1] << 8) * g) >> 14;
+			v = v > 32767 ? 32767 : (v < -32768 ? -32768 : v);
+			b[0] = v & 0xFF; b[1] = (v >> 8) & 0xFF;
+			break;
+		case 2:
+			v = (int32_t)((uint32_t)b[0] << 8 | (uint32_t)b[1] << 16 | (uint32_t)b[2] << 24) >> 8;
+			v = (v * g) >> 14;
+			v = v > 8388607 ? 8388607 : (v < -8388608 ? -8388608 : v);
+			b[0] = v & 0xFF; b[1] = (v >> 8) & 0xFF; b[2] = (v >> 16) & 0xFF;
+			break;
+		case 3:
+			v = ((int64_t)(int32_t)((uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24) * g) >> 14;
+			v = v > 2147483647LL ? 2147483647LL : (v < -2147483648LL ? -2147483648LL : v);
+			b[0] = v & 0xFF; b[1] = (v >> 8) & 0xFF; b[2] = (v >> 16) & 0xFF; b[3] = (v >> 24) & 0xFF;
+			break;
+		case 4: {
+			uint32_t u = (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
+			float x;
+			memcpy(&x, &u, 4);
+			x *= (float)gain / 100.0f;
+			memcpy(&u, &x, 4);
+			b[0] = u & 0xFF; b[1] = (u >> 8) & 0xFF; b[2] = (u >> 16) & 0xFF; b[3] = (u >> 24) & 0xFF;
+			break;
+		}
+		case 5: {
+			uint64_t u = 0;
+			double x;
+			int k;
+			for (k = 7; k >= 0; k--)
+				u = u << 8 | b[k];
+			memcpy(&x, &u, 8);
+			x *= (double)gain / 100.0;
+			memcpy(&u, &x, 8);
+			for (k = 0; k < 8; k++, u >>= 8)
+				b[k] = u & 0xFF;
+			break;
+		}
+		}
+	}
+	return 1;
 }
 
 /* 0 unicast, 1 broadcast, 2 multicast, from the datagram's destination address */
@@ -489,10 +582,10 @@ static void dump_status(void)
 	f = fopen(tmp, "w");
 	if (!f)
 		return;
-	fprintf(f, "{\"uptime\":%ld,\"rx\":%llu,\"bad\":%llu,\"unknown\":%llu,\"tx\":%llu,\"txerr\":%llu,\"filtered\":%llu,\"listen\":[",
+	fprintf(f, "{\"uptime\":%ld,\"rx\":%llu,\"bad\":%llu,\"unknown\":%llu,\"tx\":%llu,\"txerr\":%llu,\"filtered\":%llu,\"master\":%u,\"listen\":[",
 		(long)(now - started), (unsigned long long)st_rx, (unsigned long long)st_bad,
 		(unsigned long long)st_unknown, (unsigned long long)st_tx, (unsigned long long)st_txerr,
-		(unsigned long long)st_filtered);
+		(unsigned long long)st_filtered, master_gain);
 	for (i = 0; i < nifaces; i++) {
 		fprintf(f, "%s{\"name\":", i ? "," : "");
 		json_name(f, ifaces[i], 32);
@@ -511,8 +604,8 @@ static void dump_status(void)
 		inet_ntop(AF_INET, &r->dst.sin_addr, ip, sizeof(ip));
 		fprintf(f, ",\"dst\":\"%s\",\"dst_port\":%u,\"dst_stream\":", ip, ntohs(r->dst.sin_port));
 		json_name(f, r->dst_name, NAME_LEN);
-		fprintf(f, ",\"pkts\":%llu,\"bytes\":%llu,\"lost\":%llu,\"age\":%ld}",
-			(unsigned long long)r->pkts, (unsigned long long)r->bytes,
+		fprintf(f, ",\"gain\":%u,\"pkts\":%llu,\"bytes\":%llu,\"lost\":%llu,\"age\":%ld}",
+			r->gain, (unsigned long long)r->pkts, (unsigned long long)r->bytes,
 			(unsigned long long)r->lost, r->last_seen ? (long)(now - r->last_seen) : -1L);
 	}
 	fputs("],\"streams\":[", f);
@@ -559,6 +652,7 @@ int main(int argc, char **argv)
 {
 	static uint8_t bufs[BATCH][VBAN_MAX];
 	static uint8_t hdrs[MAX_FANOUT][VBAN_HDR];
+	static uint8_t scratch[MAX_FANOUT][VBAN_MAX];   /* gain-adjusted payload copies */
 	static char cbuf[BATCH][64];
 	struct sockaddr_in addrs[BATCH], me = { .sin_family = AF_INET };
 	struct mmsghdr rx[BATCH], tx[MAX_FANOUT];
@@ -708,6 +802,11 @@ int main(int argc, char **argv)
 				tiov[nt][0].iov_len = VBAN_HDR;
 				tiov[nt][1].iov_base = p + VBAN_HDR;
 				tiov[nt][1].iov_len = len - VBAN_HDR;
+				{
+					unsigned eg = (rt->gain * master_gain + 50) / 100;   /* route x master, percent */
+					if (eg != 100 && apply_gain(scratch[nt], p + VBAN_HDR, len - VBAN_HDR, p, eg))
+						tiov[nt][1].iov_base = scratch[nt];
+				}
 				memset(&tx[nt], 0, sizeof(tx[nt]));
 				tx[nt].msg_hdr.msg_iov = tiov[nt];
 				tx[nt].msg_hdr.msg_iovlen = 2;

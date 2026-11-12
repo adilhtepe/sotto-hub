@@ -24,6 +24,10 @@ unicast streams between two other LAN hosts never reach the router's IP stack.
 The daemon route file is now TAB-separated (`route<TAB>ip<TAB>stream<TAB>ip<TAB>port<TAB>stream`) so names may contain spaces;
 `/etc/init.d/vbanhub` generates it. Test: `test/test_streams.py <binary>`.
 
+## Volume
+Every route has a volume (0-200 %, default 100) and a mute switch, plus a master volume applied on top, all with sliders on the LuCI page (changes apply instantly, no restart, no dropped packets). It scales PCM audio in the hub: uint8, int16, int24, int32 (fixed point, saturating) and float32/64; serial/text, non-PCM codecs and 12/10-bit data pass through unchanged. At 100 % the packet is forwarded bit-exact without a copy; only scaled routes pay for a payload copy (up to 45 KB of static buffers). UCI: `option gain`/`mute` on a `route` section or on `main`. Test: `test/test_gain.py`.
+A device that announces itself with a full PING0 (like `~/vban/PC/vban-pc-tx.py`, every 10 s) is added to Discovered devices automatically, no scan needed.
+
 ## Housekeeping (automatic)
 - **Orphan routes**: a route whose transmitter or receiver endpoint no longer exists is deleted automatically, on every service start/reload (`/etc/init.d/vbanhub prune` does it by hand) and instantly in LuCI when you remove an endpoint (the matrix refreshes too).
 - **Enable in LuCI starts the service**: Save & Apply restarts the service when its settings changed or it was not running; route-only changes just re-read the routes without dropping packets.

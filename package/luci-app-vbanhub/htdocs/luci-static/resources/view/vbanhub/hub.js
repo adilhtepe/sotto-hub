@@ -38,6 +38,41 @@ function pruneRoutes() {
 	return n;
 }
 
+/* Volume control for a route or the master ('main'): mute button + slider. Changes are applied right away
+ * (debounced); the hub re-reads its config without restarting or dropping packets. */
+var volChain = Promise.resolve();
+
+function volumeWidget(sec) {
+	var gain = parseInt(uci.get('vbanhub', sec, 'gain'));
+	if (isNaN(gain)) gain = 100;
+	var mute = uci.get('vbanhub', sec, 'mute') === '1';
+	var label = E('span', { 'style': 'display:inline-block;min-width:9em;text-align:left' });
+	var slider = E('input', { 'type': 'range', 'min': 0, 'max': 150, 'step': 1, 'value': gain, 'style': 'width:11em;vertical-align:middle' });
+	var btn = E('button', { 'class': 'cbi-button', 'style': 'min-width:2.6em' });
+	var timer;
+
+	function show() {
+		var db = gain > 0 ? (20 * Math.log10(gain / 100)).toFixed(1) + ' dB' : '-∞ dB';
+		label.textContent = (mute ? _('muted') + ' · ' : '') + gain + ' % (' + db + ')';
+		btn.textContent = mute ? '🔇' : '🔊';
+		btn.title = mute ? _('Unmute') : _('Mute');
+		slider.style.opacity = mute ? '0.45' : '1';
+	}
+	function commit() {
+		clearTimeout(timer);
+		timer = setTimeout(function() {
+			uci.set('vbanhub', sec, 'gain', String(gain));
+			uci.set('vbanhub', sec, 'mute', mute ? '1' : '0');
+			volChain = volChain.then(function() { return uci.save(); }).then(function() { return uci.apply(5); })
+				.catch(function(e) { ui.addNotification(null, E('p', _('Could not apply the volume: %s').format((e && e.message) || e)), 'warning'); });
+		}, 300);
+	}
+	slider.addEventListener('input', function() { gain = +slider.value; show(); commit(); });
+	btn.addEventListener('click', function(ev) { ev.preventDefault(); mute = !mute; show(); commit(); });
+	show();
+	return E('div', { 'style': 'white-space:nowrap' }, [ btn, ' ', slider, ' ', label ]);
+}
+
 var callHostHints = rpc.declare({ object: 'luci-rpc', method: 'getHostHints', expect: { '': {} } });
 
 /* Add-device dialog used by both "Known devices" and "Discovered devices".
@@ -151,6 +186,7 @@ return view.extend({
 				E('td', { 'class': 'td' }, r.dst + ':' + r.dst_port + ' / ' + r.dst_stream),
 				E('td', { 'class': 'td' }, String(r.pkts)),
 				E('td', { 'class': 'td' }, String(r.lost)),
+				E('td', { 'class': 'td' }, r.gain === 100 ? '100 %' : (r.gain === 0 ? _('muted') : r.gain + ' %')),
 				E('td', { 'class': 'td' }, ago(r.age))
 			]);
 		});
@@ -248,11 +284,12 @@ return view.extend({
 				_('Nothing found yet. Start the service and press Scan LAN. Devices must answer VBAN PING (Voicemeeter, VBAN apps do).')),
 			E('p', { 'class': 'cbi-section-descr' }, _('Ping discovery does not carry stream names. For transmitters the name is taken from the stream heard from that IP (see "Streams heard"); for receivers type the name the device expects.')),
 			E('p', {}, _('Listening on: %s').format((st.listen || []).map(function(l) { return l.name + (l.up ? '' : ' (down)'); }).join(', ') || _('all interfaces')) +
+				(st.master !== undefined && st.master !== 100 ? ' — ' + _('master volume %d %%').format(st.master) : '') +
 				(st.filtered ? ' — ' + _('%d packets from other interfaces dropped').format(st.filtered) : '')),
 			E('p', {}, _('Received: %d, forwarded: %d, send errors: %d, malformed: %d, unrouted: %d')
 				.format(st.rx || 0, st.tx || 0, st.txerr || 0, st.bad || 0, st.unknown || 0)),
 			E('h4', {}, _('Active routes')),
-			tbl([ _('From (ip / stream)'), _('To (ip:port / stream)'), _('Packets'), _('Lost'), _('Last seen') ], routes, _('No routes or daemon not running.')),
+			tbl([ _('From (ip / stream)'), _('To (ip:port / stream)'), _('Packets'), _('Lost'), _('Volume'), _('Last seen') ], routes, _('No routes or daemon not running.')),
 			E('h4', {}, _('Streams heard')),
 			E('p', { 'class': 'cbi-section-descr' }, _('Every VBAN stream that reaches the hub (sent to it or broadcast on the LAN), with the name and format read from its packets. Point a transmitter at this router or broadcast on port 6980 and it shows up here.')),
 			tbl([ _('Source'), _('Stream name'), _('Format'), _('Rate'), _('Delivery'), _('Routing'), _('Last seen'), '' ], heard, _('Nothing heard yet.'))
@@ -270,6 +307,8 @@ return view.extend({
 		s = m.section(form.NamedSection, 'main', 'vbanhub', _('Settings'));
 		o = s.option(form.Flag, 'enabled', _('Enable'));
 		o.rmempty = false;
+		o = s.option(form.DummyValue, 'gain', _('Master volume'), _('Applied to every route on top of its own volume. Works for PCM audio (8/16/24/32-bit, float); other formats pass through unchanged.'));
+		o.renderWidget = function() { return volumeWidget('main'); };
 		o = s.option(form.Value, 'port', _('Listen port'));
 		o.datatype = 'port'; o.placeholder = '6980';
 		o = s.option(form.Value, 'dscp', _('DSCP'), _('46 = EF (WMM voice queue on Wi-Fi).'));
@@ -305,6 +344,8 @@ return view.extend({
 		o.cfgvalue = function(sid) { return epName(uci.get('vbanhub', sid, 'to')); };
 		o = s.option(form.Flag, 'enabled', _('Enabled'));
 		o.default = '1'; o.rmempty = false;
+		o = s.option(form.DummyValue, 'gain', _('Volume'));
+		o.renderWidget = function(section_id) { return volumeWidget(section_id); };
 
 		s = m.section(form.GridSection, 'endpoint', _('Endpoints'));
 		s.addremove = true; s.anonymous = true; s.sortable = true;

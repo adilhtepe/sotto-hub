@@ -12,7 +12,7 @@ STOP=10
 CONF=/var/etc/vbanhub.conf
 
 gen_route() {
-	local from to sip sstream dip dport dstream en
+	local from to sip sstream dip dport dstream en gain mute
 	config_get_bool en "$1" enabled 1
 	[ "$en" = 1 ] || return 0
 	config_get from "$1" from
@@ -38,12 +38,25 @@ gen_route() {
 	if [ "$sstream" = '*' ] || [ "$dstream" = '*' ] || [ ${#sstream} -gt 16 ] || [ ${#dstream} -gt 16 ]; then
 		logger -t vbanhub "route $1 skipped: stream name invalid (max 16 chars, not '*')"; return 0
 	fi
-	printf 'route\t%s\t%s\t%s\t%s\t%s\n' "$sip" "$sstream" "$dip" "$dport" "$dstream" >> $CONF
+	# Volume: percent (0-200, 100 = unchanged); mute sends silence without losing the level.
+	config_get gain "$1" gain 100
+	config_get_bool mute "$1" mute 0
+	case "$gain" in *[!0-9]*|'') gain=100 ;; esac
+	[ "$gain" -gt 200 ] && gain=200
+	[ "$mute" = 1 ] && gain=0
+	printf 'route\t%s\t%s\t%s\t%s\t%s\t%s\n' "$sip" "$sstream" "$dip" "$dport" "$dstream" "$gain" >> $CONF
 }
 
 gen_conf() {
 	mkdir -p /var/etc
+	local mgain mmute
 	echo "# generated from /etc/config/vbanhub" > $CONF
+	config_get mgain main gain 100
+	config_get_bool mmute main mute 0
+	case "$mgain" in *[!0-9]*|'') mgain=100 ;; esac
+	[ "$mgain" -gt 200 ] && mgain=200
+	[ "$mmute" = 1 ] && mgain=0
+	printf 'master\t%s\n' "$mgain" >> $CONF
 	config_foreach gen_route route
 }
 
@@ -164,7 +177,7 @@ reload_service() {
 	prune_routes
 	# Changed settings (port, networks, scan, name...) or a service that is not running yet (just enabled
 	# in LuCI) need a full restart; a route-only change just re-reads the routes without dropping packets.
-	if ! pidof vbanhub >/dev/null || [ "$(uci -q show vbanhub.main | md5sum)" != "$(cat /var/run/vbanhub.sig 2>/dev/null)" ]; then
+	if ! pidof vbanhub >/dev/null || [ "$(uci -q show vbanhub.main | grep -v '\.\(gain\|mute\)=' | md5sum)" != "$(cat /var/run/vbanhub.sig 2>/dev/null)" ]; then
 		restart
 		return
 	fi
@@ -176,7 +189,7 @@ reload_service() {
 start_service() {
 	local enabled port dscp mdns iface scan_interval scan_ports openfw hub_name
 	prune_routes
-	uci -q show vbanhub.main | md5sum > /var/run/vbanhub.sig
+	uci -q show vbanhub.main | grep -v '\.\(gain\|mute\)=' | md5sum > /var/run/vbanhub.sig
 	config_load vbanhub
 	config_get_bool enabled main enabled 0
 	config_get port main port 6980
