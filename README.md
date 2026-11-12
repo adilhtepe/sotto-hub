@@ -13,6 +13,11 @@ VBAN is plain UDP with no handshake, auth or encryption, and existing clients
 3. **Binding**: a route only matches `(source IP, stream name)`; everything else is
    dropped and shown as "unrouted". For untrusted networks tunnel via WireGuard.
 
+## Devices and interfaces in LuCI
+- **Listen on networks**: multi-select of your OpenWrt networks (lan, guest, ...).
+- **Devices connected to this router**: DHCP/neighbour hosts from `luci-rpc getHostHints`; **Add…** opens a dialog where you set name, role (receiver/transmitter), IP, port and stream name freely.
+- Test: `test/test_iface.py <binary>`.
+
 ## LAN discovery (VBAN PING0)
 The hub can find receivers and transmitters on the LAN using VB-Audio's service/identification ping
 (spec rev 13: header sub-protocol 0x60 + 676-byte `tagVBAN_PING0`). Press **Scan LAN** in LuCI (or
@@ -58,7 +63,7 @@ mDNS (`_vban._udp`) + VBAN PING0 reply, per-route enable/disable and rate limit,
 
 ## Security notes
 Trust boundary: untrusted UDP on the hub port. VBAN has no auth, so source IP is spoofable on the same L2 segment.
-- Binds to one interface (`option iface`, default = LAN device) via `SO_BINDTODEVICE`; fails closed if it cannot.
+- Listens only on the networks chosen in LuCI (`list network`, default `lan`): the ingress interface of every packet (`IP_PKTINFO`) is checked and anything else is dropped (counted as `filtered`). Fail closed: if no selected interface exists, nothing is accepted. Discovery broadcasts go out only on the selected networks. This replaces the earlier `SO_BINDTODEVICE`, which allowed only one interface; keep WAN input blocked in the firewall (OpenWrt default).
 - Runs as `nobody`; only `/var/run/vbanhub/` is writable.
 - Routes need a source IP **and** stream name (no wildcards); names with whitespace are rejected.
 - Destinations in 0.0.0.0/8, multicast/broadcast, or loopback on the hub port are refused (loop/reflection guard). The router's own LAN IP on the hub port is not yet checked.

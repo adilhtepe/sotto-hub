@@ -1,5 +1,7 @@
 #!/bin/sh /etc/rc.common
 
+. /lib/functions/network.sh
+
 USE_PROCD=1
 EXTRA_COMMANDS="scan"
 EXTRA_HELP="	scan	Scan the LAN for VBAN devices (PING0)"
@@ -53,6 +55,16 @@ scan() {
 	procd_send_signal vbanhub '*' USR1
 }
 
+# Map a logical network (lan, guest, ...) to its L3 device; fall back to the configured device.
+add_net() {
+	local dev=""
+	network_get_device dev "$1"
+	[ -n "$dev" ] || dev="$(uci -q get network."$1".device)"
+	[ -n "$dev" ] || return 0
+	procd_append_param command -i "$dev"
+	NETS_ADDED=1
+}
+
 append_target() {
 	procd_append_param command -T "$1"
 }
@@ -83,9 +95,6 @@ start_service() {
 
 	procd_open_instance
 	# Bind to one interface (default: the LAN device) so the WAN never reaches it.
-	config_get iface main iface
-	[ -n "$iface" ] || iface="$(uci -q get network.lan.device)"
-	[ -n "$iface" ] || iface=br-lan
 
 	# Unprivileged: runs as nobody; only the state dir is writable.
 	mkdir -p /var/run/vbanhub
@@ -93,7 +102,19 @@ start_service() {
 	chmod 755 /var/run/vbanhub
 	chmod 644 $CONF
 
-	procd_set_param command /usr/sbin/vbanhub -p "$port" -t "$dscp" -i "$iface" -c $CONF -s /var/run/vbanhub/status.json
+	procd_set_param command /usr/sbin/vbanhub -p "$port" -t "$dscp" -c $CONF -s /var/run/vbanhub/status.json
+	# Listen only on the selected networks (LuCI: Listen on networks). Fail closed.
+	NETS_ADDED=0
+	config_list_foreach main network add_net
+	if [ "$NETS_ADDED" = 0 ]; then
+		config_get iface main iface            # legacy: a device name
+		if [ -n "$iface" ] && [ "$iface" != "*" ]; then
+			procd_append_param command -i "$iface"
+		else
+			add_net lan
+			[ "$NETS_ADDED" = 1 ] || procd_append_param command -i none
+		fi
+	fi
 	config_get scan_interval main scan_interval 0
 	config_get scan_ports main scan_ports 6980
 	case "$scan_interval" in *[!0-9]*|'') scan_interval=0 ;; esac

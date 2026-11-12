@@ -66,7 +66,53 @@ static uint64_t st_rx, st_bad, st_unknown, st_tx, st_txerr;
 static volatile sig_atomic_t want_reload, want_quit, want_scan;
 static const char *cfg_path = "/var/etc/vbanhub.conf";
 static const char *stat_path = "/var/run/vbanhub/status.json";
-static const char *iface;       /* SO_BINDTODEVICE; NULL = all interfaces */
+#define MAX_IFACES 8
+static const char *ifaces[MAX_IFACES]; /* listen only on these (ingress filter); none = all */
+static unsigned ifidx[MAX_IFACES];     /* resolved ifindex, 0 = not present (yet) */
+static int nifaces;
+static uint64_t st_filtered;
+
+static int iface_selected(const char *name)
+{
+	int i;
+	if (!nifaces)
+		return 1;
+	for (i = 0; i < nifaces; i++)
+		if (!strcmp(ifaces[i], name))
+			return 1;
+	return 0;
+}
+
+static void resolve_ifaces(void)
+{
+	int i;
+	for (i = 0; i < nifaces; i++)
+		ifidx[i] = if_nametoindex(ifaces[i]);
+}
+
+/* Fail closed: with a selection, a packet is accepted only from a present, selected interface. */
+static int if_allowed(int idx)
+{
+	int i;
+	if (!nifaces)
+		return 1;
+	for (i = 0; i < nifaces; i++)
+		if (ifidx[i] && ifidx[i] == (unsigned)idx)
+			return 1;
+	return 0;
+}
+
+static int ingress_ifindex(struct msghdr *m)
+{
+	struct cmsghdr *c;
+	for (c = CMSG_FIRSTHDR(m); c; c = CMSG_NXTHDR(m, c))
+		if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_PKTINFO) {
+			struct in_pktinfo pi;
+			memcpy(&pi, CMSG_DATA(c), sizeof(pi));
+			return pi.ipi_ifindex;
+		}
+	return 0;
+}
 static int listen_port = 6980;
 static time_t started;
 
@@ -220,7 +266,7 @@ static void refresh_ifaces(void)
 		if (nlocal < 16)
 			local_ip[nlocal++] = ((struct sockaddr_in *)q->ifa_addr)->sin_addr.s_addr;
 		if ((q->ifa_flags & IFF_BROADCAST) && q->ifa_broadaddr && nbcast < 8 &&
-		    (!iface || !strcmp(q->ifa_name, iface)))
+		    iface_selected(q->ifa_name))
 			bcast_ip[nbcast++] = ((struct sockaddr_in *)q->ifa_broadaddr)->sin_addr.s_addr;
 	}
 	freeifaddrs(ifa);
@@ -258,7 +304,8 @@ static void send_scan(int fd)
 	time_t now = time(NULL);
 
 	refresh_ifaces();
-	dest[nd++] = htonl(INADDR_BROADCAST);
+	if (!nifaces) /* never broadcast on the default-route (WAN) interface when a selection exists */
+		dest[nd++] = htonl(INADDR_BROADCAST);
 	for (i = 0; i < nbcast && nd < MAX_DEST; i++)
 		dest[nd++] = bcast_ip[i];
 	for (i = 0; i < nextra && nd < MAX_DEST; i++)
@@ -371,9 +418,16 @@ static void dump_status(void)
 	f = fopen(tmp, "w");
 	if (!f)
 		return;
-	fprintf(f, "{\"uptime\":%ld,\"rx\":%llu,\"bad\":%llu,\"unknown\":%llu,\"tx\":%llu,\"txerr\":%llu,\"routes\":[",
+	fprintf(f, "{\"uptime\":%ld,\"rx\":%llu,\"bad\":%llu,\"unknown\":%llu,\"tx\":%llu,\"txerr\":%llu,\"filtered\":%llu,\"listen\":[",
 		(long)(now - started), (unsigned long long)st_rx, (unsigned long long)st_bad,
-		(unsigned long long)st_unknown, (unsigned long long)st_tx, (unsigned long long)st_txerr);
+		(unsigned long long)st_unknown, (unsigned long long)st_tx, (unsigned long long)st_txerr,
+		(unsigned long long)st_filtered);
+	for (i = 0; i < nifaces; i++) {
+		fprintf(f, "%s{\"name\":", i ? "," : "");
+		json_name(f, ifaces[i], 32);
+		fprintf(f, ",\"up\":%d}", ifidx[i] ? 1 : 0);
+	}
+	fputs("],\"routes\":[", f);
 	for (i = 0; i < nroutes; i++) {
 		struct route *r = &routes[i];
 		struct in_addr a = { r->src_ip };
@@ -423,12 +477,13 @@ int main(int argc, char **argv)
 {
 	static uint8_t bufs[BATCH][VBAN_MAX];
 	static uint8_t hdrs[MAX_FANOUT][VBAN_HDR];
+	static char cbuf[BATCH][64];
 	struct sockaddr_in addrs[BATCH], me = { .sin_family = AF_INET };
 	struct mmsghdr rx[BATCH], tx[MAX_FANOUT];
 	struct iovec riov[BATCH], tiov[MAX_FANOUT][2];
 	struct sigaction sa = { .sa_handler = on_sig }; /* no SA_RESTART */
 	int port = 6980, tos = 0xB8, rcvbuf = 65536, prio = 6, c, fd, i;
-	time_t last_dump = 0;
+	time_t last_dump = 0, last_resolve = 0;
 	struct pollfd pfd;
 
 	while ((c = getopt(argc, argv, "p:c:s:t:i:S:T:P:")) != -1) {
@@ -452,7 +507,10 @@ int main(int argc, char **argv)
 			}
 			break;
 		}
-		case 'i': iface = strcmp(optarg, "*") ? optarg : NULL; break;
+		case 'i':
+			if (strcmp(optarg, "*") && nifaces < MAX_IFACES)
+				ifaces[nifaces++] = optarg;
+			break;
 		case 'p': port = atoi(optarg); break;
 		case 'c': cfg_path = optarg; break;
 		case 's': stat_path = optarg; break;
@@ -477,10 +535,8 @@ int main(int argc, char **argv)
 	setsockopt(fd, SOL_SOCKET, SO_PRIORITY, &prio, sizeof(prio));
 	listen_port = port;
 	setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &(int){ 1 }, sizeof(int));
-	if (iface && setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, iface, strlen(iface) + 1)) {
-		perror("SO_BINDTODEVICE"); /* fail closed: never fall back to all interfaces */
-		return 1;
-	}
+	setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &(int){ 1 }, sizeof(int));
+	resolve_ifaces();
 	me.sin_addr.s_addr = htonl(INADDR_ANY);
 	me.sin_port = htons(port);
 	if (bind(fd, (struct sockaddr *)&me, sizeof(me))) {
@@ -498,6 +554,10 @@ int main(int argc, char **argv)
 		int n;
 		time_t now = time(NULL);
 
+		if (nifaces && now - last_resolve >= 3) {  /* interfaces may appear later (e.g. after ifup) */
+			resolve_ifaces();
+			last_resolve = now;
+		}
 		if (want_reload) {
 			want_reload = 0;
 			load_config();
@@ -520,6 +580,8 @@ int main(int argc, char **argv)
 			rx[i].msg_hdr.msg_iovlen = 1;
 			rx[i].msg_hdr.msg_name = &addrs[i];
 			rx[i].msg_hdr.msg_namelen = sizeof(addrs[i]);
+			rx[i].msg_hdr.msg_control = cbuf[i];
+			rx[i].msg_hdr.msg_controllen = sizeof(cbuf[i]);
 		}
 		n = recvmmsg(fd, rx, BATCH, MSG_DONTWAIT, NULL);
 		for (i = 0; i < n; i++) {
@@ -528,6 +590,10 @@ int main(int argc, char **argv)
 			uint32_t sip = addrs[i].sin_addr.s_addr, fc;
 			int k, nt = 0, r;
 
+			if (!if_allowed(ingress_ifindex(&rx[i].msg_hdr))) {
+				st_filtered++;
+				continue;
+			}
 			st_rx++;
 			if ((rx[i].msg_hdr.msg_flags & MSG_TRUNC) || len < VBAN_HDR ||
 			    memcmp(p, "VBAN", 4)) {

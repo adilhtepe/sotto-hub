@@ -6,7 +6,8 @@
 				"/var/run/vbanhub/status.json": [ "read" ],
 				"/etc/init.d/vbanhub": [ "exec" ]
 			},
-			"uci": [ "vbanhub" ]
+			"uci": [ "vbanhub" ],
+			"ubus": { "luci-rpc": [ "getHostHints" ] }
 		},
 		"write": {
 			"uci": [ "vbanhub" ]
