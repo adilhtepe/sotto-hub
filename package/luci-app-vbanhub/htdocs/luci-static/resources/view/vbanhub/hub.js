@@ -64,7 +64,7 @@ function openAdd(pre) {
 
 	ui.showModal(_('Add device'), [
 		row(_('Name'), name), row(_('Role'), role), row(_('IP address'), ip), portRow,
-		row(_('Stream name'), [ stream, dl ], _('Max 16 characters, spaces allowed. Transmitter: the name it sends (suggestions are the names heard from this IP). Receiver: the name it expects.')),
+		row(_('Stream name'), E('span', {}, [ stream, dl ]), _('Max 16 characters, spaces allowed. Transmitter: the name it sends (suggestions are the names heard from this IP). Receiver: the name it expects.')),
 		err,
 		E('div', { 'class': 'right' }, [
 			E('button', { 'class': 'cbi-button', 'click': ui.hideModal }, _('Cancel')), ' ',
@@ -326,7 +326,13 @@ return view.extend({
 		o.datatype = 'port'; o.placeholder = '6980';
 		o.depends('role', 'rx');
 		o = s.option(form.Value, 'stream', _('Stream name'), _('Max 16 characters, spaces allowed. Transmitters: name they send. Receivers: name they expect.'));
-		o.datatype = 'and(maxlength(16),regexp(/^[^\\t*]+$/))'; o.rmempty = false;
+		/* this LuCI has no 'regexp' validator (an unknown type makes every value invalid) */
+		o.datatype = 'maxlength(16)'; o.rmempty = false;
+		o.validate = function(section_id, value) {
+			if (value == null || value === '') return _('A stream name is required');
+			if (/[\t\r\n*]/.test(value)) return _('No tabs, line breaks or * in a stream name');
+			return true;
+		};
 
 		return m.render().then(function(mapNode) {
 			poll.add(function() {
