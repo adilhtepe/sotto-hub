@@ -63,7 +63,9 @@ reuse the stream name heard in "Unrouted senders" when available. Only devices t
 Test: `test/test_discovery.py <binary>`; demo device: `test/fake_endpoint.py`.
 
 ## Layout
-- `package/vbanhub/` daemon (C, ~8 KB text, ~50 KB static BSS), UCI config, procd init
+- `package/vbanhub/` daemon (C, ~8 KB text, ~50 KB static BSS), UCI config, procd init;
+  `vbanhub.bpf.c` + `vbanhub_bpf.h`: optional kernel fast path (package `vbanhub-fastpath`)
+- `bench/` `hubbench` load/latency generator, `vm-bench.sh` (fwd / userspace / eBPF), `vm-ebpf-test.sh`
 - `package/luci-app-vbanhub/` LuCI JS view, menu + ACL
 - `test/test_fanout.py` loopback test (fan-out, rewrite, loss counting, learn)
 
@@ -71,6 +73,108 @@ Test: `test/test_discovery.py <binary>`; demo device: `test/fake_endpoint.py`.
 `poll` + `recvmmsg` (16 pkts) -> match routes -> `sendmmsg` with iovec
 `[rewritten 28-byte header][shared payload]`. No payload copy, no malloc, no audio
 decoding, no buffering (receivers keep their own jitter buffers). Outgoing DSCP EF.
+With the kernel fast path, routed packets never reach this loop (next section).
+
+## Kernel fast path (eBPF)
+Package `vbanhub-fastpath` adds a tc eBPF program (`vbanhub.bpf.c`) on the ingress of each listen
+device. For a VBAN packet sent to the hub, it does the same job as the daemon inside the kernel:
+- looks up the route (source IP, stream name);
+- per receiver, rewrites the Ethernet header, IP addresses, UDP ports and the 16-byte stream name,
+  and updates the checksums;
+- sends a clone out of the interface a FIB lookup picks, then drops the original.
+
+The packet never reaches a socket: no wake-up, no context switch, no copy to userspace.
+
+**The daemon is still the hub.** It fills the program's maps on start, on every reload, and every
+5 s for addresses. It folds the kernel's counters into `status.json`, so LuCI shows the same
+numbers. Anything the program does not handle goes up to the daemon unchanged:
+- PING0 and other SERVICE packets;
+- unrouted senders (so "Streams heard" and learning still work);
+- routes whose volume is not 100 %;
+- receivers that are local or whose neighbour (ARP) is not resolved yet;
+- IP options, fragments and VLAN-tagged frames;
+- skbs that GRO merged from several datagrams (see "GRO" below);
+- all traffic when IPv4 forwarding is off on the listen interface.
+
+If the object or `tc` is missing, or `option fastpath '0'` is set, the daemon forwards everything as
+before.
+
+**Security.** tc ingress runs before netfilter, so forwarded packets skip the firewall. Only pairs
+in the route map are forwarded, and only to the receivers the daemon accepted. Those receivers
+pass the same checks as before: no broadcast/multicast/reserved destinations, and no loop back to
+the hub port. That is stricter than the zone rule that lets VBAN in. The daemon starts as root to
+open the pinned maps, then runs as `nobody` keeping only `CAP_BPF`. Kernels before 6.5 refuse map
+updates without it when unprivileged BPF is disabled.
+
+**GRO.** Fraglist GRO (`rx-gro-list`) is on by default on every LAN and Wi-Fi port of e.g.
+mediatek targets. It merges back-to-back datagrams of one flow into a single skb, which the tc
+program cannot rewrite. On the RT-AX52 that was about 30 % of a Voicemeeter stream (packet pairs
+of 1052 bytes). Those packets went to the daemon: late, and out of order against the packets the
+kernel forwarded. The kernel has no per-flow way out of it.
+
+So with the fast path the init script turns `rx-gro-list` off on the ports of the listen bridges.
+It only touches ports where it was on, and restores them on stop. Normal GRO stays on. The cost is
+that other bulk traffic the CPU forwards loses fraglist GRO. That is not measured here.
+`option fastpath_gro_off '0'` keeps GRO as it is. `status.json` → `fastpath.to_daemon_gro` counts
+the fallbacks.
+
+**On the router** (ASUS RT-AX52, MT7981 2× Cortex-A53 1.3 GHz, OpenWrt 25.12, kernel 6.12):
+measured with `bench/router-bench.sh` from a wired LAN host that is both sender and receiver.
+Latency includes that host's own network stack. Live routes kept running during the tests.
+
+| Load | userspace hub | eBPF hub |
+|---|---|---|
+| 1 stream × 2 receivers (1.5k pkt/s out): p50 / p99 | 424 / 714 µs | 362 / 641 µs |
+| 8 × 4 (24k pkt/s): p50 / p99, lost, router CPU | 444 µs / 2.5 ms, 228 lost, 75 % of a core | 319 / 814 µs, **0 lost**, 31 % |
+| 32 × 4 (96k pkt/s) | **overloaded:** 61 % lost, p50 4.1 ms | 99.8 % delivered, p50 423 µs (p99 7 ms, softirq saturates) |
+| 64 × 4 (192k pkt/s) | 85 % lost | 42 % lost: beyond this router (~100k pkt/s out) |
+
+- At realistic loads eBPF cuts latency by 15–30 % and the p99 by two thirds, with half the CPU.
+- It roughly triples the forwarding capacity: about 35k → about 100k packets/s out.
+
+**In a VM.** These numbers come from `bench/vm-bench.sh` in a 4-vCPU QEMU VM over veth (kernel 7.0). Two runs; values
+are one-way latency sender → receiver through the hub box. `fwd` is the floor: no hub, the box only
+IP-forwards (the sender itself sends one copy per receiver).
+
+| Load (64-frame stereo packets) | fwd (floor) | userspace hub | eBPF hub |
+|---|---|---|---|
+| 1 stream, 2 receivers: p50 / p99 | 69–146 / 211–389 µs | 200–336 / 460–541 µs | 107–217 / 239–275 µs |
+| 8 streams × 4 receivers (24k pkt/s out): p50 / p99 | 26–28 / 49–66 µs | 56–57 / 108–134 µs | 36–37 / 52–89 µs |
+| 64 streams × 4 receivers (192k pkt/s out) | p50 15 µs, 0 lost | **saturated:** 1 core at 100 %, 21–30 % lost, p50 2.8–3.4 ms | p50 27–32 µs, p99 52 µs, ≤ 0.01 % lost |
+
+- **At normal load** the userspace hub adds about 30 µs to the forwarding floor; eBPF adds about 9 µs.
+- **At high load** the userspace hub tops out near 120–150k packets/s out per core. The eBPF path
+  keeps latency flat and uses no daemon CPU.
+- **At very low rates** the numbers are dominated by idle-CPU wake-up in the VM. They vary a lot
+  between runs (see the ranges).
+- **Caveat:** absolute numbers on a router's ARM/MIPS core and real NICs will differ. The ordering
+  should not.
+
+**Tests.** `bench/vm-ebpf-test.sh` runs in a throwaway VM (`sudo vng -r /boot/vmlinuz-$(uname -r)
+--memory 2G --cpus 4 --exec "sh $PWD/bench/vm-ebpf-test.sh"`). All of these pass:
+- fan-out to 4 receivers with per-route names: rename, keep, any-name and any-source keys;
+- UDP checksums verified in software by the receiver, from a full-checksum sender and from a
+  checksum-offload sender;
+- the gain route is served by the daemon;
+- `status.json` merges the kernel counters;
+- PING0 is answered and the unrouted sender is listed;
+- 10 reloads while streaming lose nothing, and a removed route stops in the kernel;
+- the daemon runs as `nobody` with `CAP_BPF` only.
+
+The userspace test suite (`test/test_*.py`, LuCI render) still passes.
+
+Verified on the RT-AX52:
+- `deploy.sh`, with `kmod-sched-bpf` and `tc-bpf` installed;
+- the verifier accepts the program on 6.12 and JITs it;
+- the init script attaches it to `br-lan` and turns `rx-gro-list` off, and stop restores both;
+- the daemon runs as `nobody` with `CAP_BPF`;
+- a live Voicemeeter route is forwarded entirely in the kernel, with 0 fallbacks.
+
+Switching paths can reorder a packet or two. When a reload briefly hands packets to the daemon,
+the next packet through the kernel can overtake them. Receivers' jitter buffers absorb this.
+
+**Not verified yet:** the OpenWrt SDK build of `vbanhub-fastpath` (`bpf.mk`), and kernels 5.15 /
+6.6. The object also compiles for big-endian (`bpfeb`, MIPS).
 
 ## Config flow
 UCI `/etc/config/vbanhub` -> init script writes `/var/etc/vbanhub.conf`

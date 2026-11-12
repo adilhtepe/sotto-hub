@@ -160,7 +160,77 @@ add_net() {
 	[ -n "$dev" ] || dev="$(uci -q get network."$1".device)"
 	[ -n "$dev" ] || return 0
 	procd_append_param command -i "$dev"
+	NET_DEVS="$NET_DEVS $dev"
 	NETS_ADDED=1
+}
+
+# ---- kernel fast path (package vbanhub-fastpath): tc eBPF program on each listen device ----
+# Forwards routed packets without gain inside the kernel; the daemon fills its maps and handles
+# everything else. Removing the filter (stop) hands all traffic back to the daemon.
+BPF_OBJ=/lib/bpf/vbanhub.o
+BPF_PIN=/sys/fs/bpf/tc/globals
+TC_PREF=49
+TC_DEVS=/var/run/vbanhub.tcdevs
+GRO_DEVS=/var/run/vbanhub.grolist
+
+# Fraglist GRO (rx-gro-list, on by default on e.g. mediatek) merges back-to-back datagrams of a
+# flow into one skb per port. The tc program cannot rewrite such a merged skb, so those packets
+# fall back to the daemon: slower, and reordered against the ones the kernel forwards (measured
+# on an RT-AX52: ~30 % of a Voicemeeter stream). With fastpath_gro_off the hub turns rx-gro-list
+# off on the ports of its listen bridges and restores them on stop. Trade-off: other bulk
+# traffic routed by the CPU loses fraglist GRO (normal GRO stays on).
+gro_list_off() {   # $@ = listen devices (bridges or plain ports)
+	local dev p ports
+	for dev in "$@"; do
+		ports="$dev"
+		[ -d /sys/class/net/$dev/brif ] && ports="$(ls /sys/class/net/$dev/brif)"
+		for p in $ports; do
+			ethtool -k "$p" 2>/dev/null | grep -q '^rx-gro-list: on$' || continue
+			ethtool -K "$p" rx-gro-list off 2>/dev/null && echo "$p" >> $GRO_DEVS
+		done
+	done
+}
+
+gro_list_restore() {
+	local p
+	for p in $(cat $GRO_DEVS 2>/dev/null); do
+		ethtool -K "$p" rx-gro-list on 2>/dev/null
+	done
+	rm -f $GRO_DEVS
+}
+
+fastpath_off() {
+	local dev
+	for dev in $(cat $TC_DEVS 2>/dev/null); do
+		tc filter del dev "$dev" ingress pref $TC_PREF 2>/dev/null
+	done
+	rm -f $TC_DEVS
+	gro_list_restore
+	# Unpin the maps too: the daemon refills them on start, and a new object version may
+	# change their layout (tc refuses to reuse a pinned map that differs).
+	rm -f $BPF_PIN/vbanhub_* 2>/dev/null
+}
+
+fastpath_on() {   # $@ = devices; returns 0 if attached to at least one
+	local dev ok=1
+	fastpath_off
+	[ -f $BPF_OBJ ] && command -v tc >/dev/null 2>&1 || return 1
+	grep -q ' /sys/fs/bpf bpf' /proc/mounts || mount -t bpf bpf /sys/fs/bpf 2>/dev/null || return 1
+	for dev in "$@"; do
+		tc qdisc add dev "$dev" clsact 2>/dev/null   # may already exist (shared with e.g. qosify)
+		if tc filter replace dev "$dev" ingress pref $TC_PREF handle 1 bpf direct-action \
+			obj $BPF_OBJ sec tc 2>/dev/null; then
+			echo "$dev" >> $TC_DEVS
+			ok=0
+		else
+			logger -t vbanhub "kernel fast path: cannot attach to $dev, the daemon forwards its traffic"
+		fi
+	done
+	return $ok
+}
+
+stop_service() {
+	fastpath_off
 }
 
 append_target() {
@@ -226,7 +296,7 @@ reload_service() {
 }
 
 start_service() {
-	local enabled port dscp mdns iface scan_interval scan_ports openfw hub_name
+	local enabled port dscp mdns iface scan_interval scan_ports openfw hub_name fastpath gro_off
 	prune_routes
 	uci -q show vbanhub.main | grep -v '\.\(gain\|mute\)=' | md5sum > /var/run/vbanhub.sig
 	config_load vbanhub
@@ -235,6 +305,7 @@ start_service() {
 	config_get dscp main dscp 46
 	config_get_bool mdns main mdns 1
 	if [ "$enabled" != 1 ]; then
+		fastpath_off
 		gen_mdns 0 "$port"
 		fw_sync ""
 		return 0
@@ -256,11 +327,13 @@ start_service() {
 	procd_set_param command /usr/sbin/vbanhub -p "$port" -t "$dscp" -c $CONF -s /var/run/vbanhub/status.json
 	# Listen only on the selected networks (LuCI: Listen on networks). Fail closed.
 	NETS_ADDED=0
+	NET_DEVS=""
 	config_list_foreach main network add_net
 	if [ "$NETS_ADDED" = 0 ]; then
 		config_get iface main iface            # legacy: a device name
 		if [ -n "$iface" ] && [ "$iface" != "*" ]; then
 			procd_append_param command -i "$iface"
+			NET_DEVS="$iface"
 		else
 			add_net lan
 			[ "$NETS_ADDED" = 1 ] || procd_append_param command -i none
@@ -275,7 +348,17 @@ start_service() {
 	case "$scan_ports" in *[!0-9,]*|'') scan_ports=6980 ;; esac
 	procd_append_param command -S "$scan_interval" -P "$scan_ports"
 	config_list_foreach main scan_target append_target
-	procd_set_param user nobody
+	# Kernel fast path if installed and enabled: the daemon starts as root to open the pinned maps,
+	# then drops to nobody keeping only CAP_BPF. Otherwise procd starts it as nobody directly.
+	config_get_bool fastpath main fastpath 1
+	if [ "$fastpath" = 1 ] && [ -n "$NET_DEVS" ] && fastpath_on $NET_DEVS; then
+		config_get_bool gro_off main fastpath_gro_off 1
+		[ "$gro_off" = 1 ] && command -v ethtool >/dev/null 2>&1 && gro_list_off $NET_DEVS
+		procd_append_param command -B $BPF_PIN -U nobody
+	else
+		fastpath_off
+		procd_set_param user nobody
+	fi
 	procd_set_param respawn
 	procd_set_param limits nofile=64
 	procd_close_instance

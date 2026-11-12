@@ -10,6 +10,10 @@
  *   route <src_ip|*> <src_stream|*> <dst_ip> <dst_port> <dst_stream>
  * Lines starting with '#' are ignored.
  *
+ * Optional kernel fast path (-B <pin dir>): routes whose packets need no gain are
+ * also put in the maps of the tc eBPF program vbanhub.bpf.o, which then forwards
+ * them inside the kernel; this daemon keeps doing everything else (see that file).
+ *
  * Signals: SIGHUP reload config, SIGTERM/SIGINT quit.
  * Status JSON is written atomically every 2 s to the status path.
  */
@@ -29,6 +33,15 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <grp.h>
+#include <linux/bpf.h>
+#include <linux/capability.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#define VBANHUB_BPF 1
+#include "vbanhub_bpf.h"
+#endif
 
 #define VBAN_HDR 28
 #define VBAN_MAX 1436
@@ -50,6 +63,7 @@ struct route {
 	time_t last_seen;
 	unsigned gain;       /* effective route volume in percent (route x input x output), 100 = unchanged, 0 = mute */
 	int dst_keep;        /* destination stream name '*': forward the name the sender used, no rewrite */
+	uint64_t bpf_pkts, bpf_bytes, bpf_lost;   /* forwarded by the kernel fast path */
 };
 
 static unsigned master_gain = 100;   /* master volume in percent, applied on top of every route */
@@ -65,6 +79,7 @@ struct stream {
 	uint64_t pkts, bytes, snap_pkts;
 	time_t first_seen, last_seen, snap_ts;
 	unsigned rate;               /* packets/s, refreshed with the status dump */
+	uint64_t bpf_pkts, bpf_bytes;   /* kernel fast path totals already folded in */
 };
 
 static struct route routes[MAX_ROUTES];
@@ -72,6 +87,8 @@ static int nroutes;
 static struct stream streams[MAX_STREAMS];
 static int nstreams;
 static uint64_t st_rx, st_bad, st_unknown, st_tx, st_txerr;
+static uint64_t st_kslow, st_knofib, st_kgso;   /* kernel fast path: packets it handed to the daemon */
+static int fastpath_on;
 static volatile sig_atomic_t want_reload, want_quit, want_scan;
 static const char *cfg_path = "/var/etc/vbanhub.conf";
 static const char *stat_path = "/var/run/vbanhub/status.json";
@@ -125,7 +142,7 @@ static int ingress_info(struct msghdr *m, uint32_t *dst)
 		}
 	return 0;
 }
-static int listen_port = 6980;
+static int listen_port = 6980, listen_tos = 0xB8;
 static time_t started;
 
 static void on_sig(int s)
@@ -574,6 +591,325 @@ static void json_name(FILE *f, const char *n, int len)
 	fputc('"', f);
 }
 
+#ifdef VBANHUB_BPF
+/* ---- tc eBPF fast path: map maintenance (raw bpf(2), no libbpf needed) ---- */
+static const char *bpf_dir;      /* -B: where tc pinned the maps, e.g. /sys/fs/bpf/tc/globals */
+static int m_cfg = -1, m_local = -1, m_ifaddr = -1, m_routes = -1, m_rstat = -1, m_sstat = -1, m_gstat = -1;
+static int bpf_ncpu = 1;
+static uint64_t bpf_g_last[VH_G_N];
+
+static long sys_bpf(int cmd, union bpf_attr *a)
+{
+	return syscall(__NR_bpf, cmd, a, sizeof(*a));
+}
+
+static int bpf_get(const char *name)
+{
+	char path[256];
+	union bpf_attr a;
+	memset(&a, 0, sizeof(a));
+	snprintf(path, sizeof(path), "%s/%s", bpf_dir, name);
+	a.pathname = (uint64_t)(uintptr_t)path;
+	return (int)sys_bpf(BPF_OBJ_GET, &a);
+}
+
+static int bpf_upd(int fd, const void *k, const void *v)
+{
+	union bpf_attr a;
+	memset(&a, 0, sizeof(a));
+	a.map_fd = fd; a.key = (uint64_t)(uintptr_t)k; a.value = (uint64_t)(uintptr_t)v; a.flags = BPF_ANY;
+	return (int)sys_bpf(BPF_MAP_UPDATE_ELEM, &a);
+}
+
+static int bpf_lookup(int fd, const void *k, void *v)
+{
+	union bpf_attr a;
+	memset(&a, 0, sizeof(a));
+	a.map_fd = fd; a.key = (uint64_t)(uintptr_t)k; a.value = (uint64_t)(uintptr_t)v;
+	return (int)sys_bpf(BPF_MAP_LOOKUP_ELEM, &a);
+}
+
+/* next key after k (k == NULL: first); 0 on success */
+static int bpf_next(int fd, const void *k, void *next)
+{
+	union bpf_attr a;
+	memset(&a, 0, sizeof(a));
+	a.map_fd = fd; a.key = (uint64_t)(uintptr_t)k; a.next_key = (uint64_t)(uintptr_t)next;
+	return (int)sys_bpf(BPF_MAP_GET_NEXT_KEY, &a);
+}
+
+static void bpf_clear(int fd, size_t ksz)
+{
+	uint8_t k[64];
+	union bpf_attr a;
+	while (!bpf_next(fd, NULL, k)) {
+		memset(&a, 0, sizeof(a));
+		a.map_fd = fd; a.key = (uint64_t)(uintptr_t)k;
+		if (sys_bpf(BPF_MAP_DELETE_ELEM, &a))
+			break;
+	}
+	(void)ksz;
+}
+
+static int bpf_open(void)
+{
+	long n = sysconf(_SC_NPROCESSORS_CONF);
+	if (!bpf_dir)
+		return 0;
+	bpf_ncpu = n > 0 ? (int)n : 1;
+	m_cfg = bpf_get("vbanhub_cfg"); m_local = bpf_get("vbanhub_local"); m_ifaddr = bpf_get("vbanhub_ifaddr");
+	m_routes = bpf_get("vbanhub_routes"); m_rstat = bpf_get("vbanhub_rstat"); m_sstat = bpf_get("vbanhub_sstat");
+	m_gstat = bpf_get("vbanhub_gstat");
+	if (m_cfg < 0 || m_local < 0 || m_ifaddr < 0 || m_routes < 0 || m_rstat < 0 || m_sstat < 0 || m_gstat < 0) {
+		fprintf(stderr, "vbanhub: eBPF maps not found in %s (%s); running without the kernel fast path\n",
+			bpf_dir, strerror(errno));
+		bpf_dir = NULL;
+		return -1;
+	}
+	return 0;
+}
+
+/* Hub addresses (unicast + broadcast) and per-interface source addresses. */
+static void bpf_sync_ifaces(void)
+{
+	struct ifaddrs *ifa, *q;
+	uint32_t one = 1, zero = 0, bc = htonl(INADDR_BROADCAST);
+	int i;
+
+	if (!bpf_dir)
+		return;
+	bpf_clear(m_local, 4);
+	bpf_clear(m_ifaddr, 4);
+	for (i = 0; i < nlocal; i++)
+		bpf_upd(m_local, &local_ip[i], &zero);
+	for (i = 0; i < nbcast; i++)
+		bpf_upd(m_local, &bcast_ip[i], &one);
+	bpf_upd(m_local, &bc, &one);
+	if (getifaddrs(&ifa))
+		return;
+	for (q = ifa; q; q = q->ifa_next) {
+		uint32_t idx, have;
+		if (!q->ifa_addr || q->ifa_addr->sa_family != AF_INET || !(idx = if_nametoindex(q->ifa_name)))
+			continue;
+		if (bpf_lookup(m_ifaddr, &idx, &have))   /* first (primary) address of each interface */
+			bpf_upd(m_ifaddr, &idx, &((struct sockaddr_in *)q->ifa_addr)->sin_addr.s_addr);
+	}
+	freeifaddrs(ifa);
+}
+
+/* Does route r match packets of key k? (k.any_name = a stream name no name-specific route uses) */
+static int bpf_route_matches(const struct route *r, const struct vh_key *k)
+{
+	if (r->src_ip && r->src_ip != k->src_ip)
+		return 0;
+	if (r->src_any_name)
+		return 1;
+	return !k->any_name && !memcmp(r->src_name, k->name, NAME_LEN);
+}
+
+/* Rebuild the route map from routes[]. The kernel does a single lookup (exact, then
+ * (any ip, name), (ip, any name), (any, any)), so every key holds ALL routes that match
+ * it, wildcards included: keys are every (source ip x stream name) pair used by the
+ * routes plus the wildcard forms. Called after load_config(): while it runs the fast
+ * path is off and packets go to this daemon, which already has the new routes. */
+static void bpf_sync_routes(void)
+{
+	static struct vh_key keys[VH_MAX_KEYS];
+	static struct vh_val vals[VH_MAX_KEYS];
+	static uint32_t ips[VH_MAX_KEYS];
+	static char names[VH_MAX_KEYS][NAME_LEN];
+	struct vh_rstat zs;
+	struct vh_cfg cfg;
+	uint32_t z = 0, i;
+	int nk = 0, nip = 0, nnm = 0, r, k, a, b, keep, ok = 1;
+
+	if (!bpf_dir)
+		return;
+	memset(&cfg, 0, sizeof(cfg));
+	cfg.port = htons(listen_port);
+	cfg.tos = (uint8_t)listen_tos;
+	cfg.enabled = 0;
+	bpf_upd(m_cfg, &z, &cfg);
+	for (r = 0; r < nroutes; r++) {
+		for (a = 0; a < nip && routes[r].src_ip && ips[a] != routes[r].src_ip; a++)
+			;
+		if (routes[r].src_ip && a == nip)
+			ips[nip++] = routes[r].src_ip;
+		for (a = 0; a < nnm && !routes[r].src_any_name && memcmp(names[a], routes[r].src_name, NAME_LEN); a++)
+			;
+		if (!routes[r].src_any_name && a == nnm)
+			memcpy(names[nnm++], routes[r].src_name, NAME_LEN);
+	}
+	if ((nip + 1) * (nnm + 1) > VH_MAX_KEYS) {
+		fprintf(stderr, "vbanhub: %d sources x %d stream names is too many for the eBPF fast path; "
+			"the daemon forwards everything\n", nip, nnm);
+		ok = 0;
+	}
+	memset(keys, 0, sizeof(keys));
+	memset(vals, 0, sizeof(vals));
+	for (a = 0; ok && a <= nip; a++)          /* a == nip: any source ip */
+		for (b = 0; b <= nnm; b++) {          /* b == nnm: any stream name */
+			struct vh_key *key = &keys[nk];
+			struct vh_val *v = &vals[nk];
+			key->src_ip = a < nip ? ips[a] : 0;
+			key->any_name = b == nnm;
+			if (b < nnm)
+				memcpy(key->name, names[b], NAME_LEN);
+			/* "keep the sender's name" destinations first: the kernel renames forward only */
+			for (keep = 1; keep >= 0; keep--)
+				for (r = 0; r < nroutes; r++) {
+					struct route *rt = &routes[r];
+					struct vh_dst *d;
+					if (rt->dst_keep != keep || !bpf_route_matches(rt, key))
+						continue;
+					if ((rt->gain * master_gain + 50) / 100 != 100 || v->n >= VH_MAX_FO || r >= VH_MAX_ROUTES) {
+						v->slow = 1;  /* gain needs a payload copy, or too wide: daemon */
+						continue;
+					}
+					d = &v->d[v->n++];
+					d->daddr = rt->dst.sin_addr.s_addr;
+					d->dport = rt->dst.sin_port;
+					d->keep = (uint8_t)keep;
+					d->route = (uint32_t)r;
+					memcpy(d->name, rt->dst_name, NAME_LEN);
+				}
+			if (v->n || v->slow)
+				nk++;
+			else
+				memset(key, 0, sizeof(*key));
+		}
+	bpf_clear(m_routes, sizeof(struct vh_key));
+	memset(&zs, 0, sizeof(zs));
+	for (i = 0; i < VH_MAX_ROUTES; i++)        /* route indices may have changed */
+		bpf_upd(m_rstat, &i, &zs);
+	for (k = 0; k < nk; k++)
+		if (bpf_upd(m_routes, &keys[k], &vals[k])) {
+			fprintf(stderr, "vbanhub: eBPF route map update failed: %s\n", strerror(errno));
+			ok = 0;
+		}
+	cfg.enabled = (uint8_t)ok;
+	bpf_upd(m_cfg, &z, &cfg);
+}
+
+static void note_stream(uint32_t ip, uint16_t port_be, const uint8_t *p, unsigned len, int kind, int routed, time_t now);
+
+/* Fold the kernel's counters into routes[] / streams[] / st_* before a status dump. */
+static void bpf_merge_stats(void)
+{
+	static uint64_t *pc;
+	struct vh_key k, nk;
+	struct vh_sstat ss;
+	struct timespec ts;
+	uint64_t mono;
+	time_t now = time(NULL);
+	int r, have = 0;
+	uint32_t g;
+
+	if (!bpf_dir)
+		return;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	mono = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+	for (r = 0; r < nroutes && r < VH_MAX_ROUTES; r++) {
+		struct vh_rstat rs;
+		uint32_t i = (uint32_t)r;
+		if (bpf_lookup(m_rstat, &i, &rs) || !rs.pkts)
+			continue;
+		routes[r].bpf_pkts = rs.pkts;
+		routes[r].bpf_bytes = rs.bytes;
+		routes[r].bpf_lost = rs.lost;
+		if (rs.last_ns && mono >= rs.last_ns) {
+			time_t t = now - (time_t)((mono - rs.last_ns) / 1000000000ull);
+			if (t > routes[r].last_seen)
+				routes[r].last_seen = t;
+		}
+	}
+	if (!pc)
+		pc = calloc((size_t)bpf_ncpu, sizeof(*pc));
+	for (g = 0; pc && g < VH_G_N; g++) {
+		uint64_t sum = 0, d;
+		int c;
+		if (bpf_lookup(m_gstat, &g, pc))
+			continue;
+		for (c = 0; c < bpf_ncpu; c++)
+			sum += pc[c];
+		d = sum - bpf_g_last[g];
+		bpf_g_last[g] = sum;
+		if (g == VH_G_RX) st_rx += d;
+		else if (g == VH_G_TX) st_tx += d;
+		else if (g == VH_G_TXERR) st_txerr += d;
+		else if (g == VH_G_SLOW) st_kslow += d;
+		else if (g == VH_G_NOFIB) st_knofib += d;
+		else if (g == VH_G_GSO) st_kgso += d;
+	}
+	/* Streams heard on the fast path: feed the deltas through note_stream(). */
+	while (!bpf_next(m_sstat, have ? &k : NULL, &nk)) {
+		uint8_t hdr[VBAN_HDR];
+		int i;
+		k = nk;
+		have = 1;
+		if (bpf_lookup(m_sstat, &k, &ss))
+			continue;
+		for (i = 0; i < nstreams; i++)
+			if (streams[i].ip == k.src_ip && !memcmp(streams[i].name, k.name, NAME_LEN))
+				break;
+		if (i < nstreams && ss.pkts <= streams[i].bpf_pkts)
+			continue;                      /* nothing new */
+		memset(hdr, 0, sizeof(hdr));
+		memcpy(hdr, "VBAN", 4);
+		memcpy(hdr + 4, ss.hdr, 4);
+		memcpy(hdr + 8, k.name, NAME_LEN);
+		note_stream(k.src_ip, ss.port, hdr, VBAN_HDR, ss.kind, 1, now);
+		for (i = 0; i < nstreams; i++)
+			if (streams[i].ip == k.src_ip && !memcmp(streams[i].name, k.name, NAME_LEN)) {
+				struct stream *s = &streams[i];
+				/* note_stream counted one packet of VBAN_HDR bytes; replace with the real deltas */
+				s->pkts += ss.pkts - s->bpf_pkts - 1;
+				s->bytes += ss.bytes - s->bpf_bytes - VBAN_HDR;
+				s->bpf_pkts = ss.pkts;
+				s->bpf_bytes = ss.bytes;
+				break;
+			}
+	}
+}
+/* -U: switch to an unprivileged user once the socket and the map fds are open. With the
+ * fast path, CAP_BPF alone is kept: kernels before 6.5 refuse every bpf(2) call (map
+ * updates on reload too) to callers without it when unprivileged BPF is disabled. */
+static int drop_privileges(const char *user)
+{
+	struct __user_cap_header_struct h = { _LINUX_CAPABILITY_VERSION_3, 0 };
+	struct __user_cap_data_struct d[2];
+	char line[256];
+	unsigned long uid = 0, gid = 0;
+	size_t ul = strlen(user);
+	int found = 0;
+	FILE *f = fopen("/etc/passwd", "r");   /* not getpwnam(): static glibc NSS fails on musl systems */
+
+	while (f && !found && fgets(line, sizeof(line), f))
+		found = !strncmp(line, user, ul) && line[ul] == ':' &&
+			sscanf(strchr(line + ul + 1, ':') ? strchr(line + ul + 1, ':') + 1 : "", "%lu:%lu", &uid, &gid) == 2;
+	if (f)
+		fclose(f);
+	if (!found || !uid)
+		return fprintf(stderr, "vbanhub: no unprivileged user %s in /etc/passwd\n", user), -1;
+	if (prctl(PR_SET_KEEPCAPS, bpf_dir ? 1 : 0, 0, 0, 0) || setgroups(0, NULL) ||
+	    setgid((gid_t)gid) || setuid((uid_t)uid))
+		return perror("vbanhub: drop privileges"), -1;
+	memset(d, 0, sizeof(d));
+	if (bpf_dir) {
+		d[CAP_TO_INDEX(CAP_BPF)].effective = d[CAP_TO_INDEX(CAP_BPF)].permitted = CAP_TO_MASK(CAP_BPF);
+	}
+	if (syscall(SYS_capset, &h, d))
+		return perror("vbanhub: capset"), -1;
+	prctl(PR_SET_KEEPCAPS, 0, 0, 0, 0);
+	return 0;
+}
+#else
+static int drop_privileges(const char *user) { (void)user; return 0; }
+static void bpf_sync_ifaces(void) {}
+static void bpf_sync_routes(void) {}
+static void bpf_merge_stats(void) {}
+#endif
+
 static void dump_status(void)
 {
 	char tmp[128];
@@ -582,14 +918,17 @@ static void dump_status(void)
 	int i;
 	time_t now = time(NULL);
 
+	bpf_merge_stats();
 	snprintf(tmp, sizeof(tmp), "%s.tmp", stat_path);
 	f = fopen(tmp, "w");
 	if (!f)
 		return;
-	fprintf(f, "{\"uptime\":%ld,\"rx\":%llu,\"bad\":%llu,\"unknown\":%llu,\"tx\":%llu,\"txerr\":%llu,\"filtered\":%llu,\"master\":%u,\"listen\":[",
+	fprintf(f, "{\"uptime\":%ld,\"rx\":%llu,\"bad\":%llu,\"unknown\":%llu,\"tx\":%llu,\"txerr\":%llu,\"filtered\":%llu,\"master\":%u,"
+		"\"fastpath\":{\"on\":%d,\"to_daemon_gain\":%llu,\"to_daemon_unresolved\":%llu,\"to_daemon_gro\":%llu},\"listen\":[",
 		(long)(now - started), (unsigned long long)st_rx, (unsigned long long)st_bad,
 		(unsigned long long)st_unknown, (unsigned long long)st_tx, (unsigned long long)st_txerr,
-		(unsigned long long)st_filtered, master_gain);
+		(unsigned long long)st_filtered, master_gain, fastpath_on, (unsigned long long)st_kslow,
+		(unsigned long long)st_knofib, (unsigned long long)st_kgso);
 	for (i = 0; i < nifaces; i++) {
 		fprintf(f, "%s{\"name\":", i ? "," : "");
 		json_name(f, ifaces[i], 32);
@@ -612,8 +951,8 @@ static void dump_status(void)
 		else
 			json_name(f, r->dst_name, NAME_LEN);
 		fprintf(f, ",\"gain\":%u,\"pkts\":%llu,\"bytes\":%llu,\"lost\":%llu,\"age\":%ld}",
-			r->gain, (unsigned long long)r->pkts, (unsigned long long)r->bytes,
-			(unsigned long long)r->lost, r->last_seen ? (long)(now - r->last_seen) : -1L);
+			r->gain, (unsigned long long)(r->pkts + r->bpf_pkts), (unsigned long long)(r->bytes + r->bpf_bytes),
+			(unsigned long long)(r->lost + r->bpf_lost), r->last_seen ? (long)(now - r->last_seen) : -1L);
 	}
 	fputs("],\"streams\":[", f);
 	for (i = 0; i < nstreams; i++) {
@@ -666,12 +1005,17 @@ int main(int argc, char **argv)
 	struct iovec riov[BATCH], tiov[MAX_FANOUT][2];
 	struct sigaction sa = { .sa_handler = on_sig }; /* no SA_RESTART */
 	int port = 6980, tos = 0xB8, rcvbuf = 65536, prio = 6, c, fd, i;
-	time_t last_dump = 0, last_resolve = 0;
+	time_t last_dump = 0, last_resolve = 0, last_ifsync = 0;
+	const char *run_as = NULL;
 	struct pollfd pfd;
 
-	while ((c = getopt(argc, argv, "p:c:s:t:i:S:T:P:N:")) != -1) {
+	while ((c = getopt(argc, argv, "p:c:s:t:i:S:T:P:N:B:U:")) != -1) {
 		switch (c) {
 		case 'S': scan_interval = atoi(optarg); break;
+#ifdef VBANHUB_BPF
+		case 'B': bpf_dir = optarg; break;   /* tc eBPF map pin directory */
+#endif
+		case 'U': run_as = optarg; break;    /* drop to this user after setup */
 		case 'N': hub_name = optarg; break;
 		case 'T': {
 			struct in_addr a;
@@ -700,7 +1044,7 @@ int main(int argc, char **argv)
 		case 's': stat_path = optarg; break;
 		case 't': tos = atoi(optarg) << 2; break; /* DSCP value */
 		default:
-			fprintf(stderr, "usage: %s [-p port] [-c conf] [-s statusfile] [-t dscp]\n", argv[0]);
+			fprintf(stderr, "usage: %s [-p port] [-c conf] [-s statusfile] [-t dscp] [-B bpf_pin_dir] [-U user]\n", argv[0]);
 			return 1;
 		}
 	}
@@ -718,6 +1062,7 @@ int main(int argc, char **argv)
 	setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
 	setsockopt(fd, SOL_SOCKET, SO_PRIORITY, &prio, sizeof(prio));
 	listen_port = port;
+	listen_tos = tos;
 	setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &(int){ 1 }, sizeof(int));
 	setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &(int){ 1 }, sizeof(int));
 	resolve_ifaces();
@@ -731,6 +1076,15 @@ int main(int argc, char **argv)
 	refresh_ifaces();
 	if (load_config() < 0)
 		fprintf(stderr, "vbanhub: cannot read %s, starting with no routes\n", cfg_path);
+#ifdef VBANHUB_BPF
+	if (!bpf_open()) {
+		fastpath_on = 1;
+		bpf_sync_ifaces();
+		bpf_sync_routes();
+	}
+#endif
+	if (run_as && drop_privileges(run_as))
+		return 1;
 	pfd.fd = fd;
 	pfd.events = POLLIN;
 
@@ -742,9 +1096,17 @@ int main(int argc, char **argv)
 			resolve_ifaces();
 			last_resolve = now;
 		}
+#ifdef VBANHUB_BPF
+		if (bpf_dir && now - last_ifsync >= 5) {   /* addresses change (DHCP, ifup): keep the kernel's copy current */
+			last_ifsync = now;
+			refresh_ifaces();
+			bpf_sync_ifaces();
+		}
+#endif
 		if (want_reload) {
 			want_reload = 0;
 			load_config();
+			bpf_sync_routes();
 		}
 		/* A requested scan (button / SIGUSR1) is never dropped: within 3 s of the previous scan it is
 		 * deferred to the next loop iteration (<= 1 s later) instead of being ignored. */
@@ -843,6 +1205,13 @@ int main(int argc, char **argv)
 			}
 		}
 	}
+#ifdef VBANHUB_BPF
+	if (bpf_dir) {   /* the program stays attached until the init script removes it: hand everything back */
+		struct vh_cfg off = { 0, 0, 0 };
+		uint32_t z = 0;
+		bpf_upd(m_cfg, &z, &off);
+	}
+#endif
 	unlink(stat_path);   /* no status file = not running (LuCI shows it) */
 	return 0;
 }

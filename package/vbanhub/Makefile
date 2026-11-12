@@ -6,6 +6,9 @@ PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 
 include $(INCLUDE_DIR)/package.mk
+include $(INCLUDE_DIR)/bpf.mk
+
+PKG_BUILD_DEPENDS:=bpf-headers
 
 define Package/vbanhub
   SECTION:=net
@@ -40,8 +43,26 @@ define Build/Prepare
 	$(CP) ./src/* $(PKG_BUILD_DIR)/
 endef
 
+define Package/vbanhub-fastpath
+  SECTION:=net
+  CATEGORY:=Network
+  TITLE:=Kernel (tc eBPF) fast path for vbanhub
+  DEPENDS:=+vbanhub +tc-bpf +kmod-sched-core +kmod-sched-bpf $(BPF_DEPENDS)
+endef
+
+define Package/vbanhub-fastpath/description
+  tc eBPF program that forwards vbanhub's routes (at 100 % volume) inside the
+  kernel. The daemon keeps its maps current and handles everything else.
+endef
+
 define Build/Compile
+	$(call CompileBPF,$(PKG_BUILD_DIR)/vbanhub.bpf.c)
 	$(MAKE) -C $(PKG_BUILD_DIR) CC="$(TARGET_CC)" CFLAGS="$(TARGET_CFLAGS)" LDFLAGS="$(TARGET_LDFLAGS)"
+endef
+
+define Package/vbanhub-fastpath/install
+	$(INSTALL_DIR) $(1)/lib/bpf
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/vbanhub.bpf.o $(1)/lib/bpf/vbanhub.o
 endef
 
 define Package/vbanhub/install
@@ -52,3 +73,4 @@ define Package/vbanhub/install
 endef
 
 $(eval $(call BuildPackage,vbanhub))
+$(eval $(call BuildPackage,vbanhub-fastpath))
