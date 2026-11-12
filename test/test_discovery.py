@@ -27,7 +27,7 @@ def endpoint(port, btype, dev, app, host):
         except socket.timeout: pass
     t = threading.Thread(target=run); t.start(); return t
 
-open(conf, "w").write(f"route 127.0.0.1 Mic1 127.0.0.1 {PD} StudioA\n")
+open(conf, "w").write(f"route\t127.0.0.1\tMic1\t127.0.0.1\t{PD}\tStudioA\n")
 routed = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); routed.bind(("127.0.0.1", PD)); routed.settimeout(1)
 ths = [endpoint(PR, 0x1, b"Speakers", b"Voicemeeter", b"PC-A\xff"),     # receiver (+ non-ascii byte -> '?')
        endpoint(PT, 0x2, b"Mic", b"VBAN Talkie", b"phone")]            # transmitter

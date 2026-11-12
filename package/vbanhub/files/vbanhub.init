@@ -24,11 +24,20 @@ gen_route() {
 	config_get dport "$to" port 6980
 	config_get dstream "$to" stream
 	[ -n "$sip" ] && [ -n "$sstream" ] && [ -n "$dip" ] && [ -n "$dstream" ] || return 0
-	# Config is whitespace-delimited: reject names that would shift fields.
-	case "$sip$sstream$dip$dport$dstream" in
-		*[[:space:]]*|*'*'*) logger -t vbanhub "route $1 skipped: invalid characters"; return 0 ;;
+	# The daemon config is TAB-separated, so stream names may contain spaces.
+	# Reject tabs/newlines, the '*' wildcard, whitespace in ip/port, and names over 16 bytes.
+	case "$sip$dip$dport" in
+		*[[:space:]]*|*'*'*) logger -t vbanhub "route $1 skipped: bad address"; return 0 ;;
 	esac
-	echo "route $sip $sstream $dip $dport $dstream" >> $CONF
+	local tab="$(printf '\t')" nl="
+"
+	case "$sstream$dstream" in
+		*"$tab"*|*"$nl"*) logger -t vbanhub "route $1 skipped: stream name has tab/newline"; return 0 ;;
+	esac
+	if [ "$sstream" = '*' ] || [ "$dstream" = '*' ] || [ ${#sstream} -gt 16 ] || [ ${#dstream} -gt 16 ]; then
+		logger -t vbanhub "route $1 skipped: stream name invalid (max 16 chars, not '*')"; return 0
+	fi
+	printf 'route\t%s\t%s\t%s\t%s\t%s\n' "$sip" "$sstream" "$dip" "$dport" "$dstream" >> $CONF
 }
 
 gen_conf() {

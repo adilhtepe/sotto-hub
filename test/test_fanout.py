@@ -11,9 +11,9 @@ rx1, rx2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM), socket.socket(socke
 rx1.bind(("127.0.0.1", 0)); rx2.bind(("127.0.0.1", 0))
 rx1.settimeout(2); rx2.settimeout(2)
 open(conf, "w").write(
-    f"route 127.0.0.1 Mic1 127.0.0.1 {rx1.getsockname()[1]} StudioA\n"
-    f"route 127.0.0.1 Mic1 127.0.0.1 {rx2.getsockname()[1]} StudioB\n"
-    f"route 127.0.0.1 Loop 127.0.0.1 {HUB} Loop\n")  # must be refused (loop into hub)
+    f"route\t127.0.0.1\tMic1\t127.0.0.1\t{rx1.getsockname()[1]}\tStudioA\n"
+    f"route\t127.0.0.1\tMic1\t127.0.0.1\t{rx2.getsockname()[1]}\tStudioB\n"
+    f"route\t127.0.0.1\tLoop\t127.0.0.1\t{HUB}\tLoop\n")  # must be refused (loop into hub)
 p = subprocess.Popen([binp, "-p", str(HUB), "-c", conf, "-s", stat])
 time.sleep(0.3)
 
@@ -48,7 +48,7 @@ import json
 s = json.load(open(stat))
 print(json.dumps(s, indent=1))
 ok &= s["rx"] == 8 and s["bad"] == 2 and s["unknown"] == 3 and s["tx"] == 6 and len(s["routes"]) == 2
-ok &= all(r["lost"] == 3 for r in s["routes"]) and s["learned"][0]["stream"] == "Other"
+ok &= all(r["lost"] == 3 for r in s["routes"]) and any(x["stream"] == "Other" and not x["routed"] for x in s["streams"])
 p.send_signal(signal.SIGTERM); p.wait()
 print("PASS" if ok else "FAILED"); sys.exit(0 if ok else 1)
 

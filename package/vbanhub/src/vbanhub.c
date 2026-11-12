@@ -34,7 +34,7 @@
 #define VBAN_MAX 1436
 #define NAME_LEN 16
 #define MAX_ROUTES 256
-#define MAX_LEARN 32
+#define MAX_STREAMS 64
 #define BATCH 16
 #define MAX_FANOUT 32
 
@@ -50,18 +50,23 @@ struct route {
 	time_t last_seen;
 };
 
-struct learned {
+/* Every VBAN stream heard (routed or not), keyed by (source ip, 16-byte stream name). */
+struct stream {
 	uint32_t ip;
-	char name[NAME_LEN + 1];
-	uint8_t sr, nbs, nbc, bit;
-	uint64_t pkts;
-	time_t last_seen;
+	uint16_t port;               /* last source port (host order) */
+	char name[NAME_LEN];         /* raw, not NUL-terminated if 16 long */
+	uint8_t sr, nbs, nbc, bit;   /* raw header bytes 4..7 */
+	uint8_t kind;                /* 0 unicast, 1 broadcast, 2 multicast */
+	uint8_t routed;              /* matched at least one route on the last packet */
+	uint64_t pkts, bytes, snap_pkts;
+	time_t first_seen, last_seen, snap_ts;
+	unsigned rate;               /* packets/s, refreshed with the status dump */
 };
 
 static struct route routes[MAX_ROUTES];
 static int nroutes;
-static struct learned learn[MAX_LEARN];
-static int nlearn;
+static struct stream streams[MAX_STREAMS];
+static int nstreams;
 static uint64_t st_rx, st_bad, st_unknown, st_tx, st_txerr;
 static volatile sig_atomic_t want_reload, want_quit, want_scan;
 static const char *cfg_path = "/var/etc/vbanhub.conf";
@@ -102,13 +107,16 @@ static int if_allowed(int idx)
 	return 0;
 }
 
-static int ingress_ifindex(struct msghdr *m)
+/* Ingress ifindex (0 if unknown) and the datagram's destination address. */
+static int ingress_info(struct msghdr *m, uint32_t *dst)
 {
 	struct cmsghdr *c;
+	*dst = 0;
 	for (c = CMSG_FIRSTHDR(m); c; c = CMSG_NXTHDR(m, c))
 		if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_PKTINFO) {
 			struct in_pktinfo pi;
 			memcpy(&pi, CMSG_DATA(c), sizeof(pi));
+			*dst = pi.ipi_addr.s_addr;
 			return pi.ipi_ifindex;
 		}
 	return 0;
@@ -141,15 +149,27 @@ static int load_config(void)
 	if (!f)
 		return -1;
 	while (fgets(line, sizeof(line), f) && n < MAX_ROUTES) {
-		char sip[32], sname[64], dip[32], dname[64];
-		int dport;
+		/* TAB-separated so stream names may contain spaces:
+		 * route \t src_ip|* \t src_stream|* \t dst_ip \t dst_port \t dst_stream */
+		char *fld[6], *t = line, *sip, *sname, *dip, *dname;
+		int dport, nf = 0;
 		struct route *r;
 		struct in_addr a;
 
 		if (line[0] == '#')
 			continue;
-		if (sscanf(line, "route %31s %63s %31s %d %63s", sip, sname, dip, &dport, dname) != 5)
+		line[strcspn(line, "\r\n")] = 0;
+		while (nf < 6) {
+			fld[nf++] = t;
+			t = strchr(t, '\t');
+			if (!t)
+				break;
+			*t++ = 0;
+		}
+		if (nf != 6 || strcmp(fld[0], "route") || !fld[2][0] || !fld[5][0])
 			continue;
+		sip = fld[1]; sname = fld[2]; dip = fld[3]; dname = fld[5];
+		dport = atoi(fld[4]);
 		if (dport < 1 || dport > 65535)
 			continue;
 		r = &routes[n];
@@ -185,34 +205,6 @@ static int load_config(void)
 	return n;
 }
 
-static void note_unknown(uint32_t ip, const uint8_t *p)
-{
-	int i;
-	time_t now = time(NULL);
-
-	for (i = 0; i < nlearn; i++)
-		if (learn[i].ip == ip && !memcmp(learn[i].name, p + 8, NAME_LEN))
-			goto hit;
-	if (nlearn < MAX_LEARN) {
-		i = nlearn++;
-	} else { /* evict oldest */
-		int o = 0;
-		for (i = 1; i < MAX_LEARN; i++)
-			if (learn[i].last_seen < learn[o].last_seen)
-				o = i;
-		i = o;
-	}
-	memset(&learn[i], 0, sizeof(learn[i]));
-	learn[i].ip = ip;
-	memcpy(learn[i].name, p + 8, NAME_LEN);
-hit:
-	learn[i].sr = p[4];
-	learn[i].nbs = p[5];
-	learn[i].nbc = p[6];
-	learn[i].bit = p[7];
-	learn[i].pkts++;
-	learn[i].last_seen = now;
-}
 
 
 /* ---- LAN discovery via VBAN PING0 (service identification), spec rev 13 ----
@@ -393,6 +385,63 @@ static void handle_service(int fd, const uint8_t *p, unsigned len, const struct 
 	sendto(fd, rep, sizeof(rep), MSG_DONTWAIT, (const struct sockaddr *)from, sizeof(*from));
 }
 
+/* 0 unicast, 1 broadcast, 2 multicast, from the datagram's destination address */
+static int dst_kind(uint32_t a)
+{
+	int i;
+	if ((ntohl(a) >> 28) == 0xE)
+		return 2;
+	if (a == htonl(INADDR_BROADCAST))
+		return 1;
+	for (i = 0; i < nbcast; i++)
+		if (bcast_ip[i] == a)
+			return 1;
+	return 0;
+}
+
+/* Record/refresh a heard stream (routed or not). Fast path: same entry as the previous packet. */
+static void note_stream(uint32_t ip, uint16_t port_be, const uint8_t *p, unsigned len, int kind, int routed, time_t now)
+{
+	static int last = -1;
+	struct stream *s;
+	int i;
+
+	if (last >= 0 && last < nstreams && streams[last].ip == ip && !memcmp(streams[last].name, p + 8, NAME_LEN)) {
+		i = last;
+		goto hit;
+	}
+	for (i = 0; i < nstreams; i++)
+		if (streams[i].ip == ip && !memcmp(streams[i].name, p + 8, NAME_LEN))
+			goto found;
+	if (nstreams < MAX_STREAMS) {
+		i = nstreams++;
+	} else { /* evict the least recently heard */
+		int o = 0;
+		for (i = 1; i < MAX_STREAMS; i++)
+			if (streams[i].last_seen < streams[o].last_seen)
+				o = i;
+		i = o;
+	}
+	memset(&streams[i], 0, sizeof(streams[i]));
+	streams[i].ip = ip;
+	memcpy(streams[i].name, p + 8, NAME_LEN);
+	streams[i].first_seen = streams[i].snap_ts = now;
+found:
+	last = i;
+hit:
+	s = &streams[i];
+	s->port = ntohs(port_be);
+	s->sr = p[4]; s->nbs = p[5]; s->nbc = p[6]; s->bit = p[7];
+	s->kind = kind;
+	s->routed = routed;
+	s->pkts++;
+	s->bytes += len;
+	s->last_seen = now;
+}
+
+static const unsigned sr_hz[21] = { 6000, 12000, 24000, 48000, 96000, 192000, 384000, 8000, 16000, 32000,
+	64000, 128000, 256000, 512000, 11025, 22050, 44100, 88200, 176400, 352800, 705600 };
+
 static void json_name(FILE *f, const char *n, int len)
 {
 	int i;
@@ -444,14 +493,25 @@ static void dump_status(void)
 			(unsigned long long)r->pkts, (unsigned long long)r->bytes,
 			(unsigned long long)r->lost, r->last_seen ? (long)(now - r->last_seen) : -1L);
 	}
-	fputs("],\"learned\":[", f);
-	for (i = 0; i < nlearn; i++) {
-		struct in_addr a = { learn[i].ip };
-		fprintf(f, "%s{\"ip\":\"%s\",\"stream\":", i ? "," : "", inet_ntoa(a));
-		json_name(f, learn[i].name, NAME_LEN);
-		fprintf(f, ",\"sr\":%u,\"nbs\":%u,\"nbc\":%u,\"bit\":%u,\"pkts\":%llu,\"age\":%ld}",
-			learn[i].sr, learn[i].nbs, learn[i].nbc, learn[i].bit,
-			(unsigned long long)learn[i].pkts, (long)(now - learn[i].last_seen));
+	fputs("],\"streams\":[", f);
+	for (i = 0; i < nstreams; i++) {
+		struct stream *s = &streams[i];
+		struct in_addr a = { s->ip };
+		long dt = (long)(now - s->snap_ts);
+		unsigned idx = s->sr & 0x1F;
+
+		if (dt >= 1) {
+			s->rate = (unsigned)((s->pkts - s->snap_pkts) / dt);
+			s->snap_pkts = s->pkts;
+			s->snap_ts = now;
+		}
+		fprintf(f, "%s{\"ip\":\"%s\",\"port\":%u,\"stream\":", i ? "," : "", inet_ntoa(a), s->port);
+		json_name(f, s->name, NAME_LEN);
+		fprintf(f, ",\"sub\":%u,\"hz\":%u,\"samples\":%u,\"channels\":%u,\"fmt\":%u,\"codec\":%u,"
+			"\"kind\":%u,\"routed\":%u,\"pkts\":%llu,\"bytes\":%llu,\"rate\":%u,\"age\":%ld}",
+			s->sr & 0xE0, idx < 21 ? sr_hz[idx] : 0, s->nbs + 1, s->nbc + 1, s->bit & 0x07, s->bit & 0xF0,
+			s->kind, s->routed, (unsigned long long)s->pkts, (unsigned long long)s->bytes, s->rate,
+			(long)(now - s->last_seen));
 	}
 	fputs("],\"discovered\":[", f);
 	for (i = 0; i < ndisc; i++) {
@@ -590,7 +650,9 @@ int main(int argc, char **argv)
 			uint32_t sip = addrs[i].sin_addr.s_addr, fc;
 			int k, nt = 0, r;
 
-			if (!if_allowed(ingress_ifindex(&rx[i].msg_hdr))) {
+			uint32_t dstaddr;
+
+			if (!if_allowed(ingress_info(&rx[i].msg_hdr, &dstaddr))) {
 				st_filtered++;
 				continue;
 			}
@@ -632,9 +694,9 @@ int main(int argc, char **argv)
 				rt->last_seen = now;
 				nt++;
 			}
+			note_stream(sip, addrs[i].sin_port, p, len, dst_kind(dstaddr), nt > 0, now);
 			if (!nt) {
 				st_unknown++;
-				note_unknown(sip, p);
 				continue;
 			}
 			k = sendmmsg(fd, tx, nt, MSG_DONTWAIT);

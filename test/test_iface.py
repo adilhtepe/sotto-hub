@@ -6,7 +6,7 @@ binp = sys.argv[1]; d = tempfile.mkdtemp()
 def run(ifs, port):
     conf, stat = f"{d}/c{port}", f"{d}/s{port}.json"
     rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); rx.bind(("127.0.0.1", 0)); rx.settimeout(1)
-    open(conf, "w").write(f"route 127.0.0.1 Mic1 127.0.0.1 {rx.getsockname()[1]} Out\n")
+    open(conf, "w").write(f"route\t127.0.0.1\tMic1\t127.0.0.1\t{rx.getsockname()[1]}\tOut\n")
     args = [binp, "-p", str(port), "-c", conf, "-s", stat] + [a for i in ifs for a in ("-i", i)]
     p = subprocess.Popen(args); time.sleep(0.4)
     tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

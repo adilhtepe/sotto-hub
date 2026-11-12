@@ -13,6 +13,17 @@ VBAN is plain UDP with no handshake, auth or encryption, and existing clients
 3. **Binding**: a route only matches `(source IP, stream name)`; everything else is
    dropped and shown as "unrouted". For untrusted networks tunnel via WireGuard.
 
+## Stream names and formats
+The hub reads the 28-byte header of every stream that reaches it (sent to the router or broadcast on the LAN
+to the hub port) and lists it under **Streams heard**: source IP:port, the exact 16-byte stream name
+(spaces allowed), sub-protocol (audio/serial/text), sample rate, channels, sample format, codec, packets/s,
+unicast/broadcast/multicast and whether it is routed. Known devices and discovered devices show the names heard
+from their IP, and **Add as transmitter** pre-fills the exact name (suggestions in the dialog). Receivers' expected
+names cannot be learned from traffic, so type them. Limit: only streams sent to the hub or broadcast are visible;
+unicast streams between two other LAN hosts never reach the router's IP stack.
+The daemon route file is now TAB-separated (`route<TAB>ip<TAB>stream<TAB>ip<TAB>port<TAB>stream`) so names may contain spaces;
+`/etc/init.d/vbanhub` generates it. Test: `test/test_streams.py <binary>`.
+
 ## Boot, port and pings
 - The init script is **enabled at boot** (`deploy.sh` / package postinst); whether it actually runs is decided by the UCI `enabled` flag.
 - **UDP port in the firewall**: for each selected network the hub opens its port in that network's firewall zone with a managed rule `vbanhub_<zone>` (`open_firewall`, default on). Zones that already ACCEPT input (default `lan`) need none; `wan` and masquerading zones are never opened. Rules are only rewritten when they change and are removed when the hub is disabled.
