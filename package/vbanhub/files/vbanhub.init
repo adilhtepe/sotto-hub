@@ -30,15 +30,17 @@ gen_route() {
 	config_get from "$1" from
 	config_get to "$1" to
 	[ -n "$from" ] && [ -n "$to" ] || return 0
-	# No wildcard source: a route must be bound to a transmitter IP and stream.
+	# No wildcard source IP: a route is always bound to a transmitter IP.
 	config_get sip "$from" ip
 	config_get sstream "$from" stream
 	config_get dip "$to" ip
 	config_get dport "$to" port 6980
 	config_get dstream "$to" stream
-	[ -n "$sip" ] && [ -n "$sstream" ] && [ -n "$dip" ] && [ -n "$dstream" ] || return 0
-	# The daemon config is TAB-separated, so stream names may contain spaces.
-	# Reject tabs/newlines, the '*' wildcard, whitespace in ip/port, and names over 16 bytes.
+	[ -n "$sip" ] && [ -n "$dip" ] || return 0
+	# The TAB-separated daemon config allows spaces in stream names. A stream name is OPTIONAL:
+	#   input  empty -> '*'  = accept any stream from this IP
+	#   output empty -> '*'  = forward the name the input sent, unchanged
+	# User-typed names must not contain tabs/newlines, be '*', or exceed 16 bytes.
 	case "$sip$dip$dport" in
 		*[[:space:]]*|*'*'*) logger -t vbanhub "route $1 skipped: bad address"; return 0 ;;
 	esac
@@ -50,6 +52,8 @@ gen_route() {
 	if [ "$sstream" = '*' ] || [ "$dstream" = '*' ] || [ ${#sstream} -gt 16 ] || [ ${#dstream} -gt 16 ]; then
 		logger -t vbanhub "route $1 skipped: stream name invalid (max 16 chars, not '*')"; return 0
 	fi
+	[ -n "$sstream" ] || sstream='*'
+	[ -n "$dstream" ] || dstream='*'
 	# Volume: percent (0-200, 100 = unchanged); mute sends silence without losing the level.
 	config_get gain "$1" gain 100
 	config_get_bool mute "$1" mute 0

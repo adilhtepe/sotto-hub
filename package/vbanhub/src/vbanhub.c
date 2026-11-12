@@ -49,6 +49,7 @@ struct route {
 	int have_fc;
 	time_t last_seen;
 	unsigned gain;       /* effective route volume in percent (route x input x output), 100 = unchanged, 0 = mute */
+	int dst_keep;        /* destination stream name '*': forward the name the sender used, no rewrite */
 };
 
 static unsigned master_gain = 100;   /* master volume in percent, applied on top of every route */
@@ -208,7 +209,10 @@ static int load_config(void)
 			r->src_any_name = 1;
 		else
 			set_name(r->src_name, sname);
-		set_name(r->dst_name, dname);
+		if (!strcmp(dname, "*"))
+			r->dst_keep = 1;
+		else
+			set_name(r->dst_name, dname);
 		r->gain = 100;
 		if (nf == 7) {
 			int g = atoi(fld[6]);
@@ -603,7 +607,10 @@ static void dump_status(void)
 			json_name(f, r->src_name, NAME_LEN);
 		inet_ntop(AF_INET, &r->dst.sin_addr, ip, sizeof(ip));
 		fprintf(f, ",\"dst\":\"%s\",\"dst_port\":%u,\"dst_stream\":", ip, ntohs(r->dst.sin_port));
-		json_name(f, r->dst_name, NAME_LEN);
+		if (r->dst_keep)
+			fputs("\"*\"", f);
+		else
+			json_name(f, r->dst_name, NAME_LEN);
 		fprintf(f, ",\"gain\":%u,\"pkts\":%llu,\"bytes\":%llu,\"lost\":%llu,\"age\":%ld}",
 			r->gain, (unsigned long long)r->pkts, (unsigned long long)r->bytes,
 			(unsigned long long)r->lost, r->last_seen ? (long)(now - r->last_seen) : -1L);
@@ -797,7 +804,8 @@ int main(int argc, char **argv)
 				if (!rt->src_any_name && memcmp(rt->src_name, p + 8, NAME_LEN))
 					continue;
 				memcpy(hdrs[nt], p, VBAN_HDR);
-				memcpy(hdrs[nt] + 8, rt->dst_name, NAME_LEN);
+				if (!rt->dst_keep)
+					memcpy(hdrs[nt] + 8, rt->dst_name, NAME_LEN);
 				tiov[nt][0].iov_base = hdrs[nt];
 				tiov[nt][0].iov_len = VBAN_HDR;
 				tiov[nt][1].iov_base = p + VBAN_HDR;

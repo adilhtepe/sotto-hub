@@ -89,7 +89,7 @@ function openAdd(pre) {
 	var ip = E('input', { 'class': 'cbi-input-text', type: 'text', value: pre.ip || '' });
 	var port = E('input', { 'class': 'cbi-input-text', type: 'number', min: 1, max: 65535, value: pre.port || 6980 });
 	var dl = E('datalist', { id: 'vbanhub-streams' }, (pre.suggest || []).map(function(n) { return E('option', { value: n }); }));
-	var stream = E('input', { 'class': 'cbi-input-text', type: 'text', maxlength: 16, list: 'vbanhub-streams', value: pre.stream || 'Stream1' });
+	var stream = E('input', { 'class': 'cbi-input-text', type: 'text', maxlength: 16, list: 'vbanhub-streams', value: pre.stream || '' });
 	var err = E('p', { 'class': 'alert-message', 'style': 'display:none' });
 	var portRow = E('div', { 'class': 'cbi-value' }, [ E('label', { 'class': 'cbi-value-title' }, _('Port (receivers)')), E('div', { 'class': 'cbi-value-field' }, port) ]);
 	function sync() { portRow.style.display = role.value === 'rx' ? '' : 'none'; }
@@ -102,14 +102,14 @@ function openAdd(pre) {
 
 	ui.showModal(_('Add device'), [
 		row(_('Name'), name), row(_('Role'), role), row(_('IP address'), ip), portRow,
-		row(_('Stream name'), E('span', {}, [ stream, dl ]), _('Max 16 characters, spaces allowed. Transmitter: the name it sends (suggestions are the names heard from this IP). Receiver: the name it expects.')),
+		row(_('Stream name (optional)'), E('span', {}, [ stream, dl ]), _('Leave empty in most cases. Transmitter: empty = accept any stream from this IP; fill it only to pick one of several streams it sends. Receiver: empty = keep the name the transmitter used; fill it only if the receiver accepts just one specific name. Max 16 characters, spaces allowed.')),
 		err,
 		E('div', { 'class': 'right' }, [
 			E('button', { 'class': 'cbi-button', 'click': ui.hideModal }, _('Cancel')), ' ',
 			E('button', { 'class': 'cbi-button cbi-button-positive', 'click': function() {
 				var bad = null;
 				if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(ip.value)) bad = _('Invalid IPv4 address');
-				else if (!stream.value || stream.value.length > 16 || /[\t\r\n*]/.test(stream.value)) bad = _('Stream name must be 1-16 characters, without tabs or *');
+				else if (stream.value && (stream.value.length > 16 || /[\t\r\n*]/.test(stream.value))) bad = _('A stream name is at most 16 characters, without tabs or *');
 				else if (role.value === 'rx' && !(port.value >= 1 && port.value <= 65535)) bad = _('Invalid port');
 				if (bad) { err.textContent = bad; err.style.display = ''; return; }
 				var id = uci.add('vbanhub', 'endpoint');
@@ -117,7 +117,7 @@ function openAdd(pre) {
 				uci.set('vbanhub', id, 'role', role.value);
 				uci.set('vbanhub', id, 'ip', ip.value);
 				if (role.value === 'rx') uci.set('vbanhub', id, 'port', String(port.value));
-				uci.set('vbanhub', id, 'stream', stream.value);
+				if (stream.value) uci.set('vbanhub', id, 'stream', stream.value);
 				uci.save().then(function() { ui.hideModal(); location.reload(); });
 			} }, _('Add'))
 		])
@@ -217,12 +217,14 @@ return view.extend({
 			return E('tr', { 'class': 'tr' }, [
 				E('td', { 'class': 'td' }, E('strong', {}, e.name || e.ip)),
 				E('td', { 'class': 'td' }, e.ip),
-				E('td', { 'class': 'td' }, e.stream || '-'),
+				E('td', { 'class': 'td' }, e.stream || E('em', {}, _('any'))),
 				E('td', { 'class': 'td' }, liveCell(function(s) {
-					var h = (s.streams || []).filter(function(x) { return x.ip === e.ip && x.stream === e.stream; })[0];
-					if (!h) return { on: false, text: _('no signal') };
-					var on = h.age <= 3;
-					return { on: on, text: streamFormat(h) + (on ? ' · ' + _('%d pkt/s').format(h.rate) : ' · ' + ago(h.age)) };
+					var hs = (s.streams || []).filter(function(x) { return x.ip === e.ip && (!e.stream || x.stream === e.stream); })
+						.sort(function(a, b) { return a.age - b.age; });
+					if (!hs.length) return { on: false, text: _('no signal') };
+					var h = hs[0], on = h.age <= 3;
+					return { on: on, text: (e.stream ? '' : h.stream + ' · ') + streamFormat(h) + (on ? ' · ' + _('%d pkt/s').format(h.rate) : ' · ' + ago(h.age)) +
+						(hs.length > 1 ? ' ' + _('(+%d more)').format(hs.length - 1) : '') };
 				})),
 				E('td', { 'class': 'td' }, links(e, 'from', 'to')),
 				E('td', { 'class': 'td' }, volumeWidget(e['.name']))
@@ -234,9 +236,9 @@ return view.extend({
 			return E('tr', { 'class': 'tr' }, [
 				E('td', { 'class': 'td' }, E('strong', {}, e.name || e.ip)),
 				E('td', { 'class': 'td' }, e.ip + ':' + port),
-				E('td', { 'class': 'td' }, e.stream || '-'),
+				E('td', { 'class': 'td' }, e.stream || E('em', {}, _('same as input'))),
 				E('td', { 'class': 'td' }, liveCell(function(s) {
-					var rs = (s.routes || []).filter(function(r) { return r.dst === e.ip && r.dst_port === port && r.dst_stream === e.stream; });
+					var rs = (s.routes || []).filter(function(r) { return r.dst === e.ip && r.dst_port === port && r.dst_stream === (e.stream || '*'); });
 					var ages = rs.map(function(r) { return r.age; }).filter(function(a) { return a >= 0; });
 					var on = ages.some(function(a) { return a <= 3; });
 					if (!rs.length) return { on: false, text: _('no input routed') };
@@ -253,11 +255,11 @@ return view.extend({
 			volumeWidget('main'),
 			E('h3', { 'style': 'margin-top:1.5em' }, _('Inputs')),
 			E('div', { 'class': 'cbi-section-descr' }, _('Transmitters sending to the hub. The volume is applied to everything this input sends.')),
-			tbl([ _('Name'), _('Address'), _('Stream name'), _('Signal'), _('Sends to'), _('Volume') ], inputs,
+			tbl([ _('Name'), _('Address'), _('Stream'), _('Signal'), _('Sends to'), _('Volume') ], inputs,
 				_('No inputs yet. Add transmitters in the Settings tab.')),
 			E('h3', { 'style': 'margin-top:1.5em' }, _('Outputs')),
 			E('div', { 'class': 'cbi-section-descr' }, _('Receivers the hub sends to. The volume is applied to everything this output receives.')),
-			tbl([ _('Name'), _('Address'), _('Stream name'), _('State'), _('Receives from'), _('Volume') ], outputs,
+			tbl([ _('Name'), _('Address'), _('Stream'), _('State'), _('Receives from'), _('Volume') ], outputs,
 				_('No outputs yet. Add receivers in the Settings tab.'))
 		]);
 	},
@@ -272,8 +274,8 @@ return view.extend({
 		var self = this;
 		var routes = (st.routes || []).map(function(r) {
 			return E('tr', { 'class': 'tr' }, [
-				E('td', { 'class': 'td' }, r.src + ' / ' + r.src_stream),
-				E('td', { 'class': 'td' }, r.dst + ':' + r.dst_port + ' / ' + r.dst_stream),
+				E('td', { 'class': 'td' }, r.src + ' / ' + (r.src_stream === '*' ? _('any stream') : r.src_stream)),
+				E('td', { 'class': 'td' }, r.dst + ':' + r.dst_port + ' / ' + (r.dst_stream === '*' ? _('name kept') : r.dst_stream)),
 				E('td', { 'class': 'td' }, String(r.pkts)),
 				E('td', { 'class': 'td' }, String(r.lost)),
 				E('td', { 'class': 'td' }, r.gain === 100 ? '100 %' : (r.gain === 0 ? _('muted') : r.gain + ' %')),
@@ -294,7 +296,7 @@ return view.extend({
 				E('td', { 'class': 'td' }, known ? E('em', {}, _('already added')) : E('button', {
 					'class': 'cbi-button cbi-button-add',
 					'click': function() {
-						openAdd({ name: l.stream, ip: l.ip, role: 'tx', stream: l.stream,
+						openAdd({ name: l.stream, ip: l.ip, role: 'tx', stream: l.stream,   /* a specific stream was picked, keep its name */
 							suggest: streamsOf(st, l.ip).map(function(x) { return x.stream; }) });
 					}
 				}, _('Add as transmitter')))
@@ -311,7 +313,7 @@ return view.extend({
 		function addEp(d, role) {
 			var mine = streamsOf(st, d.ip), names = mine.map(function(x) { return x.stream; });
 			openAdd({ name: d.host || d.device || d.ip, ip: d.ip, port: d.port, role: role,
-				stream: (role === 'tx' && names.length) ? names[0] : 'Stream1',
+				stream: '',
 				suggest: role === 'tx' ? names : (st.streams || []).map(function(x) { return x.stream; }) });
 		}
 		var found = (st.discovered || []).map(function(d) {
@@ -345,7 +347,7 @@ return view.extend({
 					E('button', { 'class': 'cbi-button cbi-button-add', 'click': function() {
 						var names = mine.map(function(x) { return x.stream; });
 						openAdd({ name: k.name || k.ip, ip: k.ip, port: 6980, role: names.length ? 'tx' : 'rx',
-							stream: names.length ? names[0] : 'Stream1',
+							stream: '',
 							suggest: names.length ? names : (st.streams || []).map(function(x) { return x.stream; }) });
 					} }, _('Add…'))
 				])
@@ -392,7 +394,7 @@ return view.extend({
 		var statusBox = E('div', { 'id': 'vbanhub-status' }, this.renderStatus(data[1]));
 
 		m = new form.Map('vbanhub', '',
-			_('Receives VBAN streams from transmitters and forwards them to selected receivers, rewriting the stream name. Point each transmitter at this router\'s IP and the hub port, using the stream name set below.'));
+			_('Receives VBAN streams from transmitters and forwards them to selected receivers. Point each transmitter at this router\'s IP and the hub port; stream names are optional (the hub matches inputs by IP and keeps the name unless you set one for an output).'));
 
 		s = m.section(form.NamedSection, 'main', 'vbanhub', _('Settings'));
 		o = s.option(form.Flag, 'enabled', _('Enable'));
@@ -424,7 +426,7 @@ return view.extend({
 		s.anonymous = true; s.addremove = false;
 		function epName(id) {
 			var e = uci.get('vbanhub', id);
-			return e ? ((e.name || id) + ' (' + (e.stream || '?') + ')') : id;
+			return e ? ((e.name || id) + (e.stream ? ' (' + e.stream + ')' : '')) : id;
 		}
 		o = s.option(form.DummyValue, 'from', _('From'));
 		o.cfgvalue = function(sid) { return epName(uci.get('vbanhub', sid, 'from')); };
@@ -455,11 +457,11 @@ return view.extend({
 		o = s.option(form.Value, 'port', _('Port (receivers)'));
 		o.datatype = 'port'; o.placeholder = '6980';
 		o.depends('role', 'rx');
-		o = s.option(form.Value, 'stream', _('Stream name'), _('Max 16 characters, spaces allowed. Transmitters: name they send. Receivers: name they expect.'));
+		o = s.option(form.Value, 'stream', _('Stream name (optional)'), _('Usually leave empty. Transmitter: any stream from this IP is accepted; fill it to pick one of several. Receiver: the name the transmitter used is kept; fill it only if the receiver accepts one specific name.'));
 		/* this LuCI has no 'regexp' validator (an unknown type makes every value invalid) */
-		o.datatype = 'maxlength(16)'; o.rmempty = false;
+		o.datatype = 'maxlength(16)'; o.rmempty = true;
 		o.validate = function(section_id, value) {
-			if (value == null || value === '') return _('A stream name is required');
+			if (value == null || value === '') return true;
 			if (/[\t\r\n*]/.test(value)) return _('No tabs, line breaks or * in a stream name');
 			return true;
 		};

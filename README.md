@@ -24,6 +24,9 @@ unicast streams between two other LAN hosts never reach the router's IP stack.
 The daemon route file is now TAB-separated (`route<TAB>ip<TAB>stream<TAB>ip<TAB>port<TAB>stream`) so names may contain spaces;
 `/etc/init.d/vbanhub` generates it. Test: `test/test_streams.py <binary>`.
 
+## Stream names are optional
+VBAN receivers filter on the stream name, but the hub does not need you to type one. An **input** (transmitter) with no name accepts any stream from its IP (set a name only to pick one of several streams the same IP sends). An **output** (receiver) with no name gets the name the input used, unchanged (set one only when the receiver accepts just one specific name, then the hub rewrites it). Internally `*` means "any" / "keep"; typing `*` as a name is rejected. If one IP sends several streams to the same unnamed-input route they are all forwarded; name the input to pick one. Test: `test/test_names.py <binary>`.
+
 ## LuCI page: two tabs
 - **Mixer** (first tab): only the *Inputs* (transmitters) and *Outputs* (receivers), each with its own live state (signal/format/pkt/s or receiving/idle), who it is routed to, and its own volume + mute slider; plus the master volume.
 - **Settings**: everything else (hub settings, routes, endpoints, routing matrix, devices on the router, discovery, streams heard, status).

@@ -21,7 +21,9 @@ function E(tag, attrs, ch) {
 String.prototype.format = function(...a) { let i = 0; return this.replace(/%[ds%]/g, m => m === '%%' ? '%' : String(a[i++])); };
 const data = { endpoint: [
   { '.name': 'tx1', '.type': 'endpoint', role: 'tx', name: 'Studio PC', ip: '192.168.2.50', stream: 'Mic One', gain: '80' },
-  { '.name': 'rx1', '.type': 'endpoint', role: 'rx', name: 'Phone', ip: '192.168.2.60', port: '6980', stream: 'Out Name', mute: '1' } ],
+  { '.name': 'rx1', '.type': 'endpoint', role: 'rx', name: 'Phone', ip: '192.168.2.60', port: '6980', stream: 'Out Name', mute: '1' },
+  { '.name': 'tx2', '.type': 'endpoint', role: 'tx', name: 'Laptop', ip: '192.168.2.70' },
+  { '.name': 'rx2', '.type': 'endpoint', role: 'rx', name: 'Speaker', ip: '192.168.2.80' } ],
   route: [ { '.name': 'r1', '.type': 'route', from: 'tx1', to: 'rx1' } ] };
 const uci = { sections: (c, t) => data[t] || [], get: (c, s, o) => { const x = [...data.endpoint, ...data.route].find(e => e['.name'] === s); return o ? (x && x[o]) : x; },
   set() {}, save: () => Promise.resolve(), remove() {}, add: () => 'new1' };
@@ -47,7 +49,7 @@ new V().render([null, st, {}]).then(root => {
   need(tabsInited === 2, 'two tab panes (got ' + tabsInited + ')');
   need(!/\[object/.test(t), 'no "[object" text');
   need(bad.length === 0, 'nested array children: ' + bad.length);
-  for (const w of ['Inputs', 'Outputs', 'Studio PC', 'Phone', 'Mic One', 'Out Name', 'Master volume', 'receiving', '48 kHz', 'MAPFORM', 'Routing matrix'])
+  for (const w of ['any', 'same as input', 'Laptop', 'Speaker', 'Inputs', 'Outputs', 'Studio PC', 'Phone', 'Mic One', 'Out Name', 'Master volume', 'receiving', '48 kHz', 'MAPFORM', 'Routing matrix'])
     need(t.includes(w), 'page contains ' + w);
   const tabsDiv = root.kids[1];
   need(tabsDiv.kids[0].attrs['data-tab-title'] === 'Mixer' && tabsDiv.kids[1].attrs['data-tab-title'] === 'Settings', 'tab titles Mixer / Settings (first tab = Mixer)');
