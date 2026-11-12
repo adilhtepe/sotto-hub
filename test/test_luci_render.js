@@ -4,7 +4,7 @@ const fs = require('fs');
 const src = fs.readFileSync(process.argv[2], 'utf8').replace(/^'use strict';/m, '').replace(/^'require .*$/mg, '');
 let bad = [];
 class Node_ { constructor(tag, attrs) { this.tag = tag; this.attrs = attrs || {}; this.kids = []; this.style = {}; this.listeners = {}; this._text = ''; }
-  appendChild(c) { this.kids.push(c); return c; } addEventListener(t, f) { this.listeners[t] = f; }
+  appendChild(c) { this.kids.push(c); c.parentNode = this; return c; } addEventListener(t, f) { this.listeners[t] = f; }
   set innerHTML(v) { this.kids = []; this._text = ''; } set textContent(v) { this.kids = []; this._text = String(v); } get textContent() { return this._text + this.kids.map(k => k.textContent).join(''); }
   get childNodes() { return this.kids; } }
 const document = { createTextNode: t => { const n = new Node_('#text'); n._text = t; return n; }, getElementById: () => null };
@@ -31,7 +31,10 @@ class FMap { constructor() { this.data = { remove() {} }; } section() { return n
 const form = { Map: FMap, NamedSection: 1, GridSection: 1, Flag: 1, Value: 1, ListValue: 1, DynamicList: 1, DummyValue: 1 };
 const view = { extend: o => { const C = function() {}; Object.assign(C.prototype, o); return C; } };
 let tabsInited = 0;
-const ui = { tabs: { initTabGroup: p => { tabsInited = p.length; } }, addNotification() {}, showModal() {}, hideModal() {} };
+const ui = { tabs: { initTabGroup: p => {   // same precondition as LuCI's: the pane group must already have a parent
+    const group = p[0].parentNode;
+    if (!group || !group.parentNode) throw new TypeError("Cannot read properties of null (reading 'insertBefore')");
+    tabsInited = p.length; } }, addNotification() {}, showModal() {}, hideModal() {} };
 const fsm = { exec: () => Promise.resolve({ code: 0 }), read_direct: () => Promise.resolve('{}') };
 const rpc = { declare: () => () => Promise.resolve({}) }, poll = { add() {} }, widgets = { NetworkSelect: 1 };
 const L = { resolveDefault: p => p, env: {} };

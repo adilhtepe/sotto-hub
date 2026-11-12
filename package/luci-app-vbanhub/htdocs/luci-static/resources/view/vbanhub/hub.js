@@ -481,6 +481,7 @@ return view.extend({
 			self.mixBanner = E('div', { 'class': 'alert-message warning', 'style': Object.keys(data[1]).length ? 'display:none' : '' },
 				_('The VBAN hub is not running, so nothing is received or routed. Open the Settings tab, tick Enable and use Save & Apply (the service starts by itself).'));
 
+			/* initTabGroup() inserts the tab menu next to the group, so the group needs a parent already */
 			var tabs = E('div', {}, [
 				E('div', { 'data-tab': 'mixer', 'data-tab-title': _('Mixer') }, [ self.mixBanner, self.mixerBox ]),
 				E('div', { 'data-tab': 'settings', 'data-tab-title': _('Settings') }, [
@@ -492,9 +493,10 @@ return view.extend({
 					statusBox
 				])
 			]);
+			var page = E('div', {}, [ E('h2', {}, _('VBAN Hub')), tabs ]);
 			ui.tabs.initTabGroup(tabs.childNodes);
 
-			return E('div', {}, [ E('h2', {}, _('VBAN Hub')), tabs ]);
+			return page;
 		});
 	},
 
