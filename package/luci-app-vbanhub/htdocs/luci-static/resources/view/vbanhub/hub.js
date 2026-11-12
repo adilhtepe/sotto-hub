@@ -25,6 +25,19 @@ function kindLabel(k) { return k === 1 ? _('broadcast') : (k === 2 ? _('multicas
 
 function streamsOf(st, ip) { return (st.streams || []).filter(function(x) { return x.ip === ip; }); }
 
+/* Delete routes whose transmitter or receiver endpoint is gone (the init script does the same on the router). */
+function pruneRoutes() {
+	var n = 0;
+	uci.sections('vbanhub', 'route').forEach(function(r) {
+		var f = r.from && uci.get('vbanhub', r.from), t = r.to && uci.get('vbanhub', r.to);
+		if (!f || !t || f['.type'] !== 'endpoint' || t['.type'] !== 'endpoint') {
+			uci.remove('vbanhub', r['.name']);
+			n++;
+		}
+	});
+	return n;
+}
+
 var callHostHints = rpc.declare({ object: 'luci-rpc', method: 'getHostHints', expect: { '': {} } });
 
 /* Add-device dialog used by both "Known devices" and "Discovered devices".
@@ -214,14 +227,20 @@ return view.extend({
 		});
 		var scanning = st.scan && st.scan.active;
 
+		var running = Object.keys(st).length > 0;
+
 		return E('div', {}, [
+			running ? '' : E('div', { 'class': 'alert-message warning' }, _('The VBAN hub is not running, so nothing is received, routed or scanned. Tick Enable in Settings and use Save & Apply (the service starts by itself).')),
 			E('h4', {}, _('Devices connected to this router')),
 			E('p', { 'class': 'cbi-section-descr' }, _('From DHCP leases and the neighbour table. Add any of them as a receiver or transmitter and choose the stream name yourself.')),
 			tbl([ _('Hostname'), _('IP address'), _('MAC address'), _('Streams heard'), '' ], known, _('No devices known.')),
 			E('h4', {}, _('Discovered devices (VBAN ping)')),
 			E('p', {}, [
 				E('button', { 'class': 'cbi-button cbi-button-action', 'click': function() {
-					return fs.exec('/etc/init.d/vbanhub', [ 'scan' ]).catch(function(e) { ui.addNotification(null, E('p', e.message)); });
+					return fs.exec('/etc/init.d/vbanhub', [ 'scan' ]).then(function(r) {
+						if (r && r.code)
+							ui.addNotification(null, E('p', (r.stderr || '').trim() || _('Scan failed: the VBAN hub is not running.')), 'warning');
+					}).catch(function(e) { ui.addNotification(null, E('p', e.message)); });
 				} }, _('Scan LAN')),
 				' ', scanning ? _('Scanning…') : (st.scan && st.scan.age >= 0 ? _('Last scan %ds ago').format(st.scan.age) : '')
 			]),
@@ -289,6 +308,15 @@ return view.extend({
 
 		s = m.section(form.GridSection, 'endpoint', _('Endpoints'));
 		s.addremove = true; s.anonymous = true; s.sortable = true;
+		/* Removing an endpoint also removes the routes that used it, and refreshes the matrix. */
+		s.handleRemove = function(section_id, ev) {
+			var cfg = this.uciconfig || this.map.config;
+			this.map.data.remove(cfg, section_id);
+			pruneRoutes();
+			return this.map.save(null, true).then(function() {
+				if (self.matrixBox) { self.matrixBox.innerHTML = ''; self.matrixBox.appendChild(self.renderMatrix()); }
+			});
+		};
 		o = s.option(form.Value, 'name', _('Name'));
 		o = s.option(form.ListValue, 'role', _('Role'));
 		o.value('tx', _('Transmitter')); o.value('rx', _('Receiver')); o.default = 'tx';
@@ -309,16 +337,20 @@ return view.extend({
 			}, 3);
 
 			self.map = m;
+			self.matrixBox = E('div', {}, self.renderMatrix());
 			return E([
 				mapNode,
 				E('h3', {}, _('Routing matrix')),
 				E('div', { 'class': 'cbi-section-descr' }, _('Tick a cell to send that transmitter to that receiver. Save endpoint changes before editing the matrix.')),
-				self.renderMatrix(),
+				self.matrixBox,
 				E('h3', {}, _('Live status')),
 				statusBox
 			]);
 		});
 	},
 
-	handleSave: function() { return this.map.save(); }
+	handleSave: function() {
+		/* after saving, drop routes left without endpoints (also done on the router at apply time) */
+		return this.map.save().then(function() { if (pruneRoutes()) return uci.save(); });
+	}
 });

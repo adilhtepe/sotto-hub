@@ -3,8 +3,9 @@
 . /lib/functions/network.sh
 
 USE_PROCD=1
-EXTRA_COMMANDS="scan"
-EXTRA_HELP="	scan	Scan the LAN for VBAN devices (PING0)"
+EXTRA_COMMANDS="scan prune"
+EXTRA_HELP="	scan	Scan the LAN for VBAN devices (PING0)
+	prune	Delete routes whose endpoints no longer exist"
 START=60
 STOP=10
 
@@ -61,6 +62,7 @@ gen_mdns() {
 }
 
 scan() {
+	pidof vbanhub >/dev/null || { echo "vbanhub is not running (enable it in LuCI and apply)" >&2; return 1; }
 	procd_send_signal vbanhub '*' USR1
 }
 
@@ -137,7 +139,35 @@ service_triggers() {
 	procd_add_reload_trigger vbanhub
 }
 
+# Delete routes whose transmitter or receiver endpoint no longer exists. Runs on every start/reload,
+# so removing an endpoint (LuCI, uci, ...) cleans up after itself. A second run finds nothing to do.
+prune_routes() {
+	local sec from to n=0
+	for sec in $(uci -X show vbanhub 2>/dev/null | sed -n 's/^vbanhub\.\([^.=]*\)=route$/\1/p'); do
+		from="$(uci -q get vbanhub.$sec.from)"; to="$(uci -q get vbanhub.$sec.to)"
+		if [ -z "$from" ] || [ -z "$to" ] ||
+		   [ "$(uci -q get vbanhub.$from)" != endpoint ] || [ "$(uci -q get vbanhub.$to)" != endpoint ]; then
+			uci -q delete vbanhub.$sec && n=$((n + 1))
+		fi
+	done
+	if [ "$n" -gt 0 ]; then
+		uci commit vbanhub
+		logger -t vbanhub "removed $n route(s) whose endpoint no longer exists"
+	fi
+}
+
+prune() {
+	prune_routes
+}
+
 reload_service() {
+	prune_routes
+	# Changed settings (port, networks, scan, name...) or a service that is not running yet (just enabled
+	# in LuCI) need a full restart; a route-only change just re-reads the routes without dropping packets.
+	if ! pidof vbanhub >/dev/null || [ "$(uci -q show vbanhub.main | md5sum)" != "$(cat /var/run/vbanhub.sig 2>/dev/null)" ]; then
+		restart
+		return
+	fi
 	config_load vbanhub
 	gen_conf
 	procd_send_signal vbanhub   # SIGHUP: reload routes, no packet loss
@@ -145,6 +175,8 @@ reload_service() {
 
 start_service() {
 	local enabled port dscp mdns iface scan_interval scan_ports openfw hub_name
+	prune_routes
+	uci -q show vbanhub.main | md5sum > /var/run/vbanhub.sig
 	config_load vbanhub
 	config_get_bool enabled main enabled 0
 	config_get port main port 6980

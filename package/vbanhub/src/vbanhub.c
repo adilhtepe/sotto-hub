@@ -645,9 +645,14 @@ int main(int argc, char **argv)
 			want_reload = 0;
 			load_config();
 		}
-		if ((want_scan && now - last_scan >= 3) || (scan_interval && now - last_scan >= scan_interval))
+		/* A requested scan (button / SIGUSR1) is never dropped: within 3 s of the previous scan it is
+		 * deferred to the next loop iteration (<= 1 s later) instead of being ignored. */
+		if (want_scan && now - last_scan >= 3) {
+			want_scan = 0;
 			send_scan(fd);
-		want_scan = 0;
+		} else if (scan_interval && now - last_scan >= scan_interval) {
+			send_scan(fd);
+		}
 		if (now - last_dump >= 2) {
 			dump_status();
 			last_dump = now;
@@ -731,6 +736,6 @@ int main(int argc, char **argv)
 			}
 		}
 	}
-	dump_status();
+	unlink(stat_path);   /* no status file = not running (LuCI shows it) */
 	return 0;
 }

@@ -24,6 +24,11 @@ unicast streams between two other LAN hosts never reach the router's IP stack.
 The daemon route file is now TAB-separated (`route<TAB>ip<TAB>stream<TAB>ip<TAB>port<TAB>stream`) so names may contain spaces;
 `/etc/init.d/vbanhub` generates it. Test: `test/test_streams.py <binary>`.
 
+## Housekeeping (automatic)
+- **Orphan routes**: a route whose transmitter or receiver endpoint no longer exists is deleted automatically, on every service start/reload (`/etc/init.d/vbanhub prune` does it by hand) and instantly in LuCI when you remove an endpoint (the matrix refreshes too).
+- **Enable in LuCI starts the service**: Save & Apply restarts the service when its settings changed or it was not running; route-only changes just re-read the routes without dropping packets.
+- **Scan LAN** is never swallowed: a request within 3 s of the previous scan is deferred, not dropped. LuCI warns when the hub is not running (no status file). Tests: `test/test_scan_defer.py`.
+
 ## Boot, port and pings
 - The init script is **enabled at boot** (`deploy.sh` / package postinst); whether it actually runs is decided by the UCI `enabled` flag.
 - **UDP port in the firewall**: for each selected network the hub opens its port in that network's firewall zone with a managed rule `vbanhub_<zone>` (`open_firewall`, default on). Zones that already ACCEPT input (default `lan`) need none; `wan` and masquerading zones are never opened. Rules are only rewritten when they change and are removed when the hub is disabled.

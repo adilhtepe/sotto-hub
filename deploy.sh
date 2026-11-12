@@ -24,5 +24,5 @@ ssh "$HOST" 'chmod 755 /usr/sbin/vbanhub.new /etc/init.d/vbanhub &&
 	/etc/init.d/vbanhub enable &&	# start at boot; the UCI "enabled" flag decides whether it runs
 	rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache &&
 	/etc/init.d/rpcd reload &&
-	{ pidof vbanhub >/dev/null && /etc/init.d/vbanhub restart; true; }'
+	/etc/init.d/vbanhub restart'   # start_service honours the UCI enabled flag and prunes orphan routes
 echo "deployed to $HOST (installed service is enabled at boot; it runs only if UCI vbanhub.main.enabled=1)"
