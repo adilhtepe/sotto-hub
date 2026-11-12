@@ -13,6 +13,11 @@ VBAN is plain UDP with no handshake, auth or encryption, and existing clients
 3. **Binding**: a route only matches `(source IP, stream name)`; everything else is
    dropped and shown as "unrouted". For untrusted networks tunnel via WireGuard.
 
+## Boot, port and pings
+- The init script is **enabled at boot** (`deploy.sh` / package postinst); whether it actually runs is decided by the UCI `enabled` flag.
+- **UDP port in the firewall**: for each selected network the hub opens its port in that network's firewall zone with a managed rule `vbanhub_<zone>` (`open_firewall`, default on). Zones that already ACCEPT input (default `lan`) need none; `wan` and masquerading zones are never opened. Rules are only rewritten when they change and are removed when the hub is disabled.
+- **Pings**: full VBAN PING0 requests (header + 676-byte struct) get a reply (device `OpenWrt VBAN hub`, app `vbanhub`, type SERVER). `test/ping_hub.py <ip>` checks it.
+
 ## Devices and interfaces in LuCI
 - **Listen on networks**: multi-select of your OpenWrt networks (lan, guest, ...).
 - **Devices connected to this router**: DHCP/neighbour hosts from `luci-rpc getHostHints`; **Add…** opens a dialog where you set name, role (receiver/transmitter), IP, port and stream name freely.

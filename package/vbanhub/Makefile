@@ -23,6 +23,18 @@ define Package/vbanhub/conffiles
 /etc/config/vbanhub
 endef
 
+define Package/vbanhub/postinst
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] || /etc/init.d/vbanhub enable
+exit 0
+endef
+
+define Package/vbanhub/prerm
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] || /etc/init.d/vbanhub disable
+exit 0
+endef
+
 define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
 	$(CP) ./src/* $(PKG_BUILD_DIR)/

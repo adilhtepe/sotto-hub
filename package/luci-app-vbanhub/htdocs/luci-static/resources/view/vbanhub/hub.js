@@ -239,6 +239,9 @@ return view.extend({
 		o = s.option(widgets.NetworkSelect, 'network', _('Listen on networks'),
 			_('The hub only accepts packets arriving on these networks; everything else is dropped. Do not select WAN.'));
 		o.multiple = true; o.nocreate = true; o.rmempty = false; o.default = 'lan';
+		o = s.option(form.Flag, 'open_firewall', _('Open UDP port in firewall'),
+			_('Adds an accept rule for the port in the firewall zones of the selected networks (never WAN). Zones that already accept input, like the default LAN, need none.'));
+		o.default = '1';
 		o = s.option(form.Value, 'scan_interval', _('Auto-scan interval (s)'), _('0 = only when you press Scan LAN.'));
 		o.datatype = 'uinteger'; o.placeholder = '0';
 		o = s.option(form.Value, 'scan_ports', _('Scan ports'), _('Comma-separated UDP ports devices listen on.'));

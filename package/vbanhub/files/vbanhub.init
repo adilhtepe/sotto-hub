@@ -55,6 +55,61 @@ scan() {
 	procd_send_signal vbanhub '*' USR1
 }
 
+# ---- firewall: open UDP <port> for the zones of the selected networks (never WAN / masq zones) ----
+# Zones whose input policy already ACCEPTs (default lan) need no rule. Rules are named vbanhub_<zone>
+# and only touched when they differ from what is wanted, so a normal restart does not reload fw4.
+zone_of_net() {
+	local net="$1" i=0 nets
+	while uci -q get "firewall.@zone[$i]" >/dev/null; do
+		nets="$(uci -q get "firewall.@zone[$i].network")"
+		case " $nets " in *" $net "*) echo "$i"; return 0 ;; esac
+		i=$((i + 1))
+	done
+	return 1
+}
+
+fw_collect() {   # config_list_foreach callback: append to FW_WANT
+	local net="$1" z name input masq
+	z="$(zone_of_net "$net")" || return 0
+	name="$(uci -q get "firewall.@zone[$z].name")"
+	input="$(uci -q get "firewall.@zone[$z].input")"
+	masq="$(uci -q get "firewall.@zone[$z].masq")"
+	[ -n "$name" ] || return 0
+	if [ "$name" = wan ] || [ "$masq" = 1 ]; then return 0; fi
+	[ "$input" = ACCEPT ] && return 0
+	case " $FW_WANT_ZONES " in *" $name "*) return 0 ;; esac
+	FW_WANT_ZONES="$FW_WANT_ZONES $name"
+	FW_WANT="$FW_WANT
+vbanhub_$name $name $FW_PORT"
+}
+
+fw_rule_secs() {
+	uci -q show firewall | sed -n 's/^firewall\.\(vbanhub_[A-Za-z0-9_]*\)=rule$/\1/p'
+}
+
+fw_sync() {   # $1 = port to open, or empty to remove all vbanhub rules
+	local have sec zone port
+	FW_PORT="$1"; FW_WANT=""; FW_WANT_ZONES=""
+	[ -n "$FW_PORT" ] && config_list_foreach main network fw_collect
+	have="$(for sec in $(fw_rule_secs); do
+		echo "$sec $(uci -q get firewall.$sec.src) $(uci -q get firewall.$sec.dest_port)"; done | sort)"
+	[ "$have" = "$(echo "$FW_WANT" | sed '/^$/d' | sort)" ] && return 0
+
+	for sec in $(fw_rule_secs); do uci -q delete firewall.$sec; done
+	echo "$FW_WANT" | sed '/^$/d' | while read -r sec zone port; do
+		uci set firewall.$sec=rule
+		uci set firewall.$sec.name="Allow-VBANHub-$zone"
+		uci set firewall.$sec.src="$zone"
+		uci set firewall.$sec.proto=udp
+		uci set firewall.$sec.dest_port="$port"
+		uci set firewall.$sec.family=ipv4
+		uci set firewall.$sec.target=ACCEPT
+	done
+	uci commit firewall
+	/etc/init.d/firewall reload >/dev/null 2>&1
+	logger -t vbanhub "firewall rules updated"
+}
+
 # Map a logical network (lan, guest, ...) to its L3 device; fall back to the configured device.
 add_net() {
 	local dev=""
@@ -80,7 +135,7 @@ reload_service() {
 }
 
 start_service() {
-	local enabled port dscp mdns iface scan_interval scan_ports
+	local enabled port dscp mdns iface scan_interval scan_ports openfw
 	config_load vbanhub
 	config_get_bool enabled main enabled 0
 	config_get port main port 6980
@@ -88,10 +143,13 @@ start_service() {
 	config_get_bool mdns main mdns 1
 	if [ "$enabled" != 1 ]; then
 		gen_mdns 0 "$port"
+		fw_sync ""
 		return 0
 	fi
 	gen_conf
 	gen_mdns "$mdns" "$port"
+	config_get_bool openfw main open_firewall 1
+	if [ "$openfw" = 1 ]; then fw_sync "$port"; else fw_sync ""; fi
 
 	procd_open_instance
 	# Bind to one interface (default: the LAN device) so the WAN never reaches it.
