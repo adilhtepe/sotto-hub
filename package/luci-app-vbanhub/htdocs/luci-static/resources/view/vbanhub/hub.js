@@ -61,10 +61,13 @@ function volumeWidget(sec) {
 	function commit() {
 		clearTimeout(timer);
 		timer = setTimeout(function() {
-			uci.set('vbanhub', sec, 'gain', String(gain));
-			uci.set('vbanhub', sec, 'mute', mute ? '1' : '0');
-			volChain = volChain.then(function() { return uci.save(); }).then(function() { return uci.apply(5); })
-				.catch(function(e) { ui.addNotification(null, E('p', _('Could not apply the volume: %s').format((e && e.message) || e)), 'warning'); });
+			/* not uci.apply(): this session may not call it. The init script validates, commits and reloads. */
+			volChain = volChain.then(function() {
+				return fs.exec('/etc/init.d/vbanhub', [ 'setvol', sec, String(gain), mute ? '1' : '0' ]);
+			}).then(function(r) {
+				if (r && r.code)
+					ui.addNotification(null, E('p', _('Could not apply the volume: %s').format((r.stderr || '').trim() || r.code)), 'warning');
+			}).catch(function(e) { ui.addNotification(null, E('p', _('Could not apply the volume: %s').format((e && e.message) || e)), 'warning'); });
 		}, 300);
 	}
 	slider.addEventListener('input', function() { gain = +slider.value; show(); commit(); });

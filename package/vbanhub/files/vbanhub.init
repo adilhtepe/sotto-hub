@@ -3,9 +3,10 @@
 . /lib/functions/network.sh
 
 USE_PROCD=1
-EXTRA_COMMANDS="scan prune"
+EXTRA_COMMANDS="scan prune setvol"
 EXTRA_HELP="	scan	Scan the LAN for VBAN devices (PING0)
-	prune	Delete routes whose endpoints no longer exist"
+	prune	Delete routes whose endpoints no longer exist
+	setvol	<main|route-id> <0-200> <0|1>  Set volume percent and mute, applied instantly"
 START=60
 STOP=10
 
@@ -171,6 +172,23 @@ prune_routes() {
 
 prune() {
 	prune_routes
+}
+
+# Volume knob used by LuCI (its session may not be allowed to call 'uci apply'): validates strictly,
+# commits and re-reads the routes without restarting or dropping packets.
+setvol() {
+	local sec="$1" gain="$2" mute="$3"
+	case "$sec" in ''|*[!A-Za-z0-9_]*) echo "bad section" >&2; return 1 ;; esac
+	case "$gain" in ''|*[!0-9]*) echo "bad gain" >&2; return 1 ;; esac
+	case "$mute" in 0|1) ;; *) echo "bad mute" >&2; return 1 ;; esac
+	[ "$gain" -gt 200 ] && gain=200
+	if [ "$sec" != main ]; then
+		[ "$(uci -q get vbanhub.$sec)" = route ] || { echo "no such route (save the page first)" >&2; return 1; }
+	fi
+	uci set vbanhub.$sec.gain="$gain"
+	uci set vbanhub.$sec.mute="$mute"
+	uci commit vbanhub
+	reload_service
 }
 
 reload_service() {
