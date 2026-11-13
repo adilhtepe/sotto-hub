@@ -66,7 +66,7 @@ int vban_sec_random(void *buf, size_t len)
     {
         uint8_t *p = (uint8_t *)buf;
         size_t got = 0;
-#if defined(__linux__)
+#if defined(__linux__) && !defined(__ANDROID__) /* bionic has getrandom() only from API 28 */
         while (got < len) {
             ssize_t r = getrandom(p + got, len - got, 0);
             if (r <= 0)
@@ -458,7 +458,7 @@ void vban_sec_wipe(vban_sec_session_t *s)
     crypto_wipe(s, sizeof(*s));
 }
 
-static void kill(vban_sec_session_t *s)
+static void session_kill(vban_sec_session_t *s)
 {
     vban_sec_wipe(s);
     s->state = VBAN_SEC_DEAD;
@@ -514,7 +514,7 @@ int vban_sec_connect(vban_sec_session_t *s, const vban_sec_id_t *id, uint32_t lo
     crypto_wipe(e, sizeof(e));
     n = vban_noise_write(&s->hs, NULL, 0, out + VBAN_SEC_HDR, cap - VBAN_SEC_HDR);
     if (n < 0) {
-        kill(s);
+        session_kill(s);
         return n;
     }
     s->initiator = 1;
@@ -544,7 +544,7 @@ int vban_sec_accept(vban_sec_session_t *s, const vban_sec_id_t *id, uint32_t loc
     crypto_wipe(e, sizeof(e));
     n = vban_noise_read(&s->hs, in + VBAN_SEC_HDR, 32, payload, 0);   /* a cookie may follow: not Noise */
     if (n < 0) {
-        kill(s);
+        session_kill(s);
         return n;
     }
     /* HS2 payload: our index (authenticated, unlike the outer header) + our certificate */
@@ -553,7 +553,7 @@ int vban_sec_accept(vban_sec_session_t *s, const vban_sec_id_t *id, uint32_t loc
     hdr(out, VBAN_SEC_HS2, local_idx, from, 0);
     n = vban_noise_write(&s->hs, payload, sizeof(payload), out + VBAN_SEC_HDR, cap - VBAN_SEC_HDR);
     if (n < 0) {
-        kill(s);
+        session_kill(s);
         return n;
     }
     s->initiator = 0;
@@ -639,22 +639,22 @@ int vban_sec_handle(vban_sec_session_t *s, const vban_sec_id_t *id, const uint8_
         vban_cert_t peer;
         n = vban_noise_read(&s->hs, in + VBAN_SEC_HDR, len - VBAN_SEC_HDR, payload, sizeof(payload));
         if (n != (int)sizeof(payload) || get32(payload) != from || !from) {
-            kill(s);
+            session_kill(s);
             return n < 0 ? n : VBAN_E_AUTH;
         }
         if ((r = check_peer(id, payload + 4, VBAN_CERT_SIZE, s->hs.rs, &peer)) != VBAN_OK) {
-            kill(s);
+            session_kill(s);
             return r;
         }
         if (cap < VBAN_SEC_HS_MAX) {
-            kill(s);
+            session_kill(s);
             return VBAN_E_NOSPACE;
         }
         s->remote_idx = from;
         hdr(out, VBAN_SEC_HS3, s->local_idx, from, 0);
         n = vban_noise_write(&s->hs, id->cert_bytes, VBAN_CERT_SIZE, out + VBAN_SEC_HDR, cap - VBAN_SEC_HDR);
         if (n < 0 || go_up(s, now_ms)) {
-            kill(s);
+            session_kill(s);
             return n < 0 ? n : VBAN_E_STATE;
         }
         s->peer = peer;
@@ -668,11 +668,11 @@ int vban_sec_handle(vban_sec_session_t *s, const vban_sec_id_t *id, const uint8_
             return VBAN_E_STATE;
         n = vban_noise_read(&s->hs, in + VBAN_SEC_HDR, len - VBAN_SEC_HDR, payload, VBAN_CERT_SIZE);
         if (n != VBAN_CERT_SIZE) {
-            kill(s);
+            session_kill(s);
             return n < 0 ? n : VBAN_E_AUTH;
         }
         if ((r = check_peer(id, payload, VBAN_CERT_SIZE, s->hs.rs, &peer)) != VBAN_OK || go_up(s, now_ms)) {
-            kill(s);
+            session_kill(s);
             return r ? r : VBAN_E_STATE;
         }
         s->peer = peer;
