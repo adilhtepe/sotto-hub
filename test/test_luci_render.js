@@ -46,7 +46,7 @@ const st = { uptime: 5, master: 100, listen: [{ name: 'br-lan', up: 1 }], routes
 new V().render([null, st, {}]).then(root => {
   const t = root.textContent; let ok = true;
   const need = (c, m) => { if (!c) { console.log('FAIL:', m); ok = false; } };
-  need(tabsInited === 2, 'two tab panes (got ' + tabsInited + ')');
+  need(tabsInited === 3, 'three tab panes (got ' + tabsInited + ')');
   need(!/\[object/.test(t), 'no "[object" text');
   need(bad.length === 0, 'nested array children: ' + bad.length);
   for (const w of ['any', 'same as input', 'Laptop', 'Speaker', 'Inputs', 'Outputs', 'Studio PC', 'Phone', 'Mic One', 'Out Name', 'Master volume', 'receiving', '48 kHz', 'MAPFORM', 'Routing matrix'])
@@ -57,5 +57,6 @@ new V().render([null, st, {}]).then(root => {
   need(mixer.includes('Studio PC') && mixer.includes('Phone') && mixer.includes('Master volume'), 'Mixer tab has inputs, outputs, master');
   need(!mixer.includes('Routing matrix') && !mixer.includes('MAPFORM'), 'Mixer tab has none of the settings');
   need(settings.includes('MAPFORM') && settings.includes('Routing matrix') && !settings.includes('Master volume'), 'Settings tab has the rest');
+  need(tabsDiv.kids.length === 3 && tabsDiv.kids[2].attrs['data-tab-title'] === 'Security', 'third tab = Security');
   console.log(ok ? 'PASS' : 'FAILED'); process.exit(ok ? 0 : 1);
 }).catch(e => { console.log('EXCEPTION', e.stack); process.exit(2); });

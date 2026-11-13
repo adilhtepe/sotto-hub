@@ -8,14 +8,18 @@ CC=${CC:-aarch64-linux-gnu-gcc}
 P=package/luci-app-vbanhub
 
 mkdir -p build
+S=package/vbanhub/src
+$CC -Os -c -w -o build/monocypher-aarch64.o $S/secure/monocypher/monocypher.c
 $CC -Os -static -s -Wall -Wextra -ffunction-sections -fdata-sections -Wl,--gc-sections \
-	-o build/vbanhub-aarch64 package/vbanhub/src/vbanhub.c
+	-I$S/secure -I$S/secure/monocypher -o build/vbanhub-aarch64 \
+	$S/vbanhub.c $S/vbanhub_cert.c $S/secure/vban_secure.c $S/secure/vban_noise.c build/monocypher-aarch64.o
 
 clang -O2 -g -Wall -target bpfel -I/usr/include/$(uname -m)-linux-gnu -c package/vbanhub/src/vbanhub.bpf.c -o build/vbanhub.bpf.o   # little-endian (aarch64)
 
 scp -O build/vbanhub-aarch64 "$HOST":/usr/sbin/vbanhub.new   # moved into place below (a running binary cannot be overwritten)
 # Kernel fast path: used only if the router has tc with eBPF support (tc-bpf / tc-full, kmod-sched-bpf).
-ssh "$HOST" 'mkdir -p /lib/bpf' && scp -O build/vbanhub.bpf.o "$HOST":/lib/bpf/vbanhub.o
+ssh "$HOST" 'mkdir -p /lib/bpf /lib/upgrade/keep.d' && scp -O build/vbanhub.bpf.o "$HOST":/lib/bpf/vbanhub.o
+scp -O package/vbanhub/files/vbanhub.keep "$HOST":/lib/upgrade/keep.d/vbanhub
 scp -O package/vbanhub/files/vbanhub.init "$HOST":/etc/init.d/vbanhub
 ssh "$HOST" '[ -f /etc/config/vbanhub ]' || scp -O package/vbanhub/files/vbanhub.config "$HOST":/etc/config/vbanhub
 ssh "$HOST" 'mkdir -p /www/luci-static/resources/view/vbanhub'

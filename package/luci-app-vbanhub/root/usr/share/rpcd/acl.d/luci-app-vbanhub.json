@@ -3,14 +3,37 @@
 		"description": "Grant access to VBAN Hub",
 		"read": {
 			"file": {
-				"/var/run/vbanhub/status.json": [ "read" ],
-				"/etc/init.d/vbanhub": [ "exec" ]
+				"/var/run/vbanhub/status.json": [
+					"read"
+				],
+				"/etc/init.d/vbanhub": [
+					"exec"
+				]
 			},
-			"uci": [ "vbanhub" ],
-			"ubus": { "luci-rpc": [ "getHostHints" ] }
+			"uci": [
+				"vbanhub"
+			],
+			"ubus": {
+				"luci-rpc": [
+					"getHostHints"
+				]
+			}
 		},
 		"write": {
-			"uci": [ "vbanhub" ]
+			"uci": [
+				"vbanhub"
+			],
+			"file": {
+				"/etc/vbanhub/upload/upload.req": [
+					"write"
+				],
+				"/etc/vbanhub/upload/upload.crt": [
+					"write"
+				],
+				"/etc/vbanhub/upload/upload.key": [
+					"write"
+				]
+			}
 		}
 	}
 }

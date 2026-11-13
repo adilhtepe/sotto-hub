@@ -33,6 +33,7 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+#include "vban/vban_secure.h"   /* secure/: synced from the SDK (tools/sync-secure.sh) */
 #ifdef __linux__
 #include <grp.h>
 #include <linux/bpf.h>
@@ -57,6 +58,8 @@ struct route {
 	int src_any_name;
 	struct sockaddr_in dst;
 	char dst_name[NAME_LEN];
+	char src_cert[VBAN_CERT_NAME_MAX + 1];   /* secure: source is the peer with this certificate name (any IP) */
+	char dst_cert[VBAN_CERT_NAME_MAX + 1];   /* secure: deliver encrypted to the peer with this certificate */
 	uint64_t pkts, bytes, lost;
 	uint32_t last_fc;
 	int have_fc;
@@ -80,6 +83,7 @@ struct stream {
 	time_t first_seen, last_seen, snap_ts;
 	unsigned rate;               /* packets/s, refreshed with the status dump */
 	uint64_t bpf_pkts, bpf_bytes;   /* kernel fast path totals already folded in */
+	char cert[VBAN_CERT_NAME_MAX + 1];   /* heard inside a secure session from this certificate */
 };
 
 static struct route routes[MAX_ROUTES];
@@ -109,11 +113,29 @@ static int iface_selected(const char *name)
 	return 0;
 }
 
+/* -W: internet-facing interfaces. Only secure VBAN (authenticated, encrypted) is accepted
+ * there; plain VBAN, pings and anything else from the internet is dropped. */
+static const char *wan_ifaces[MAX_IFACES];
+static unsigned wan_idx[MAX_IFACES];
+static int nwan;
+static uint64_t st_wan_refused;
+
 static void resolve_ifaces(void)
 {
 	int i;
 	for (i = 0; i < nifaces; i++)
 		ifidx[i] = if_nametoindex(ifaces[i]);
+	for (i = 0; i < nwan; i++)
+		wan_idx[i] = if_nametoindex(wan_ifaces[i]);
+}
+
+static int is_wan(int idx)
+{
+	int i;
+	for (i = 0; i < nwan; i++)
+		if (wan_idx[i] && wan_idx[i] == (unsigned)idx)
+			return 1;
+	return 0;
 }
 
 /* Fail closed: with a selection, a packet is accepted only from a present, selected interface. */
@@ -173,9 +195,10 @@ static int load_config(void)
 		return -1;
 	while (fgets(line, sizeof(line), f) && n < MAX_ROUTES) {
 		/* TAB-separated so stream names may contain spaces:
-		 * route \t src_ip|* \t src_stream|* \t dst_ip \t dst_port \t dst_stream [\t gain_percent]
+		 * route \t src_ip|* \t src_stream|* \t dst_ip|* \t dst_port \t dst_stream [\t gain_percent
+		 *       [\t src_cert \t dst_cert]]       (secure: certificate names, empty = plain)
 		 * master \t gain_percent */
-		char *fld[7], *t = line, *sip, *sname, *dip, *dname;
+		char *fld[9], *t = line, *sip, *sname, *dip, *dname, *scert = "", *dcert = "";
 		int dport, nf = 0;
 		struct route *r;
 		struct in_addr a;
@@ -188,21 +211,37 @@ static int load_config(void)
 			master_gain = g < 0 ? 0 : (g > 200 ? 200 : g);
 			continue;
 		}
-		while (nf < 7) {
+		while (nf < 9) {
 			fld[nf++] = t;
 			t = strchr(t, '\t');
 			if (!t)
 				break;
 			*t++ = 0;
 		}
-		if ((nf != 6 && nf != 7) || strcmp(fld[0], "route") || !fld[2][0] || !fld[5][0])
+		if ((nf != 6 && nf != 7 && nf != 9) || strcmp(fld[0], "route") || !fld[2][0] || !fld[5][0])
 			continue;
 		sip = fld[1]; sname = fld[2]; dip = fld[3]; dname = fld[5];
+		if (nf == 9) {
+			scert = fld[7];
+			dcert = fld[8];
+			if (strlen(scert) > VBAN_CERT_NAME_MAX || strlen(dcert) > VBAN_CERT_NAME_MAX)
+				continue;
+		}
 		dport = atoi(fld[4]);
-		if (dport < 1 || dport > 65535)
-			continue;
 		r = &routes[n];
 		memset(r, 0, sizeof(*r));
+		strcpy(r->src_cert, scert);
+		strcpy(r->dst_cert, dcert);
+		if (dcert[0]) {   /* the peer's session gives the address */
+			if (!strcmp(sip, "*") || inet_aton(sip, &a))
+				r->src_ip = strcmp(sip, "*") ? a.s_addr : 0;
+			else
+				continue;
+			r->dst.sin_family = AF_INET;
+			goto names;
+		}
+		if (dport < 1 || dport > 65535)
+			continue;
 		if (strcmp(sip, "*")) {
 			if (!inet_aton(sip, &a))
 				continue;
@@ -222,6 +261,9 @@ static int load_config(void)
 		r->dst.sin_family = AF_INET;
 		r->dst.sin_addr = a;
 		r->dst.sin_port = htons(dport);
+names:
+		if (r->src_cert[0])
+			r->src_ip = 0;                 /* matched by certificate, wherever the peer is */
 		if (!strcmp(sname, "*"))
 			r->src_any_name = 1;
 		else
@@ -231,7 +273,7 @@ static int load_config(void)
 		else
 			set_name(r->dst_name, dname);
 		r->gain = 100;
-		if (nf == 7) {
+		if (nf >= 7) {
 			int g = atoi(fld[6]);
 			r->gain = g < 0 ? 0 : (g > 400 ? 400 : g);   /* route x input x output */
 		}
@@ -535,6 +577,13 @@ static int dst_kind(uint32_t a)
 	return 0;
 }
 
+static int g_note_last = -1;
+static void note_stream_cert(const char *cert)
+{
+	if (g_note_last >= 0 && g_note_last < nstreams)
+		snprintf(streams[g_note_last].cert, sizeof(streams[g_note_last].cert), "%s", cert);
+}
+
 /* Record/refresh a heard stream (routed or not). Fast path: same entry as the previous packet. */
 static void note_stream(uint32_t ip, uint16_t port_be, const uint8_t *p, unsigned len, int kind, int routed, time_t now)
 {
@@ -565,6 +614,7 @@ static void note_stream(uint32_t ip, uint16_t port_be, const uint8_t *p, unsigne
 found:
 	last = i;
 hit:
+	g_note_last = i;
 	s = &streams[i];
 	s->port = ntohs(port_be);
 	s->sr = p[4]; s->nbs = p[5]; s->nbc = p[6]; s->bit = p[7];
@@ -589,6 +639,313 @@ static void json_name(FILE *f, const char *n, int len)
 		fputc(c >= 32 && c < 127 ? c : '?', f);
 	}
 	fputc('"', f);
+}
+
+/* ---- secure VBAN (option -K <pki dir>): certificates + Noise sessions, see secure/ ----
+ * Devices (SDK) start sessions with the hub. Their packets arrive encrypted in VBAN USER packets
+ * and are routed by certificate name (routes with src_cert), not by IP. Destinations with
+ * dst_cert get the packet encrypted in that peer's session; other destinations (Voicemeeter)
+ * get it plain, so the hub bridges both worlds. */
+#define SEC_PEERS 64   /* a device holds 2 slots for up to 60 s around each rekey */
+static const char *pki_dir;
+static vban_sec_id_t sec_id;
+static int sec_on;
+static vban_sec_peer_t sec_peers[SEC_PEERS];
+static vban_sec_server_t sec_srv;
+static uint64_t *sec_revoked;          /* sorted; grows with the file, no fixed limit */
+static size_t sec_nrevoked;
+static uint64_t st_sec_rx, st_sec_bad, st_sec_hs_refused, st_sec_nopeer, st_sec_toobig;
+static struct { uint32_t ip; time_t t; unsigned n; } sec_hs_ip[16];   /* per-address handshake limit */
+
+static uint64_t mono_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static int sec_read_pem(const char *name, const char *label, uint8_t *out, size_t len)
+{
+	char path[256], txt[4096];
+	FILE *f;
+	size_t n;
+	int r;
+	snprintf(path, sizeof(path), "%s/%s", pki_dir, name);
+	f = fopen(path, "rb");
+	if (!f)
+		return -1;
+	n = fread(txt, 1, sizeof(txt) - 1, f);
+	fclose(f);
+	txt[n] = 0;
+	r = vban_pem_decode(label, txt, n, out, len);
+	memset(txt, 0, sizeof(txt));
+	return r == (int)len ? 0 : -1;
+}
+
+static int cmp_u64(const void *a, const void *b)
+{
+	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+	return x < y ? -1 : x > y;
+}
+
+static int sec_is_revoked(uint64_t serial)
+{
+	return sec_nrevoked && bsearch(&serial, sec_revoked, sec_nrevoked, sizeof(*sec_revoked), cmp_u64) != NULL;
+}
+
+/* Revocation list: re-read on every config reload (readable by the unprivileged daemon). If it
+ * cannot be read completely (out of memory), secure peers are refused rather than let through. */
+static void sec_load_revoked(void)
+{
+	char path[256], line[64];
+	size_t cap = 0;
+	FILE *f;
+	sec_nrevoked = 0;
+	snprintf(path, sizeof(path), "%s/revoked", pki_dir);
+	f = fopen(path, "r");
+	while (f && fgets(line, sizeof(line), f)) {
+		unsigned long long v = strtoull(line, NULL, 10);
+		if (!v)
+			continue;
+		if (sec_nrevoked == cap) {
+			uint64_t *n = realloc(sec_revoked, (cap ? cap * 2 : 64) * sizeof(*n));
+			if (!n) {
+				fprintf(stderr, "vbanhub: revocation list too large for memory: secure VBAN off\n");
+				sec_on = 0;
+				break;
+			}
+			sec_revoked = n;
+			cap = cap ? cap * 2 : 64;
+		}
+		sec_revoked[sec_nrevoked++] = v;
+	}
+	if (f)
+		fclose(f);
+	if (sec_nrevoked)
+		qsort(sec_revoked, sec_nrevoked, sizeof(*sec_revoked), cmp_u64);
+}
+
+/* Peers must be devices (tx and/or rx) and not revoked. */
+static int sec_authorize(void *ctx, const vban_cert_t *peer)
+{
+	(void)ctx;
+	if (!(peer->role & (VBAN_CERT_ROLE_TX | VBAN_CERT_ROLE_RX)) || (peer->role & VBAN_CERT_ROLE_HUB))
+		return 1;
+	return sec_is_revoked(peer->serial);
+}
+
+/* Called once at start, while still root (the key is 0600 root). */
+static int sec_load(void)
+{
+	uint8_t sk[32], cert[VBAN_CERT_SIZE], ca[VBAN_CERT_SIZE];
+	int r;
+	if (!pki_dir)
+		return 0;
+	if (sec_read_pem("hub.key", "VBAN PRIVATE KEY", sk, 32) || sec_read_pem("hub.crt", "VBAN CERT", cert, sizeof(cert)) ||
+	    sec_read_pem("ca.crt", "VBAN CERT", ca, sizeof(ca))) {
+		fprintf(stderr, "vbanhub: secure VBAN off: no CA / hub certificate in %s\n", pki_dir);
+		memset(sk, 0, sizeof(sk));
+		return -1;
+	}
+	r = vban_sec_id_init(&sec_id, sk, cert, sizeof(cert), ca, sizeof(ca));
+	memset(sk, 0, sizeof(sk));
+	if (r) {
+		fprintf(stderr, "vbanhub: secure VBAN off: hub certificate rejected (%d: wrong CA, or not for hub.key)\n", r);
+		return -1;
+	}
+	sec_id.authorize = sec_authorize;
+	sec_on = 1;
+	sec_load_revoked();               /* turns sec_on off if the list cannot be read */
+	if (!sec_on)
+		return -1;
+	vban_sec_server_init(&sec_srv, sec_peers, SEC_PEERS, 10);
+	return 0;
+}
+
+/* A revoked device loses its live session at once, not at the next rekey. */
+static void sec_drop_revoked(void)
+{
+	int i;
+	for (i = 0; i < SEC_PEERS; i++)
+		if (sec_peers[i].s.state == VBAN_SEC_UP && sec_is_revoked(sec_peers[i].s.peer.serial))
+			vban_sec_wipe(&sec_peers[i].s);
+}
+
+/* Newest established session of a receiving peer with this certificate name. */
+static vban_sec_peer_t *sec_find(const char *name, uint64_t now)
+{
+	vban_sec_peer_t *best = NULL;
+	int i;
+	for (i = 0; i < SEC_PEERS; i++) {
+		vban_sec_peer_t *p = &sec_peers[i];
+		if (p->s.state != VBAN_SEC_UP || now - p->s.up_ms > VBAN_SEC_EXPIRE_MS || !(p->s.peer.role & VBAN_CERT_ROLE_RX) ||
+		    strcmp(p->s.peer.name, name))
+			continue;
+		if (!best || p->s.up_ms > best->s.up_ms)
+			best = p;
+	}
+	return best;
+}
+
+static int sec_hs_allowed(uint32_t ip, time_t now)
+{
+	int i, old = 0;
+	for (i = 0; i < 16; i++) {
+		if (sec_hs_ip[i].ip == ip) {
+			if (sec_hs_ip[i].t != now) {
+				sec_hs_ip[i].t = now;
+				sec_hs_ip[i].n = 0;
+			}
+			return ++sec_hs_ip[i].n <= 3;      /* 3 handshake starts per second per address */
+		}
+		if (sec_hs_ip[i].t < sec_hs_ip[old].t)
+			old = i;
+	}
+	sec_hs_ip[old].ip = ip;
+	sec_hs_ip[old].t = now;
+	sec_hs_ip[old].n = 1;
+	return 1;
+}
+
+/* ---- forwarding (plain and secure sources share it) ---- */
+static uint8_t fw_hdrs[MAX_FANOUT][VBAN_HDR];
+static uint8_t fw_scratch[MAX_FANOUT][VBAN_MAX];     /* gain-adjusted payload copies */
+static uint8_t fw_sealed[MAX_FANOUT][VBAN_HDR + VBAN_MAX];
+static struct sockaddr_in fw_dst[MAX_FANOUT];
+static struct mmsghdr fw_tx[MAX_FANOUT];
+static struct iovec fw_iov[MAX_FANOUT][2];
+
+/* Route one VBAN packet. cert = certificate name of the secure peer it came from, or NULL.
+ * Returns the number of destinations it matched. */
+static int forward(int fd, uint8_t *p, unsigned len, uint32_t sip, const char *cert, time_t now)
+{
+	static uint8_t inner[VBAN_HDR + VBAN_MAX];
+	uint64_t ms = 0;
+	uint32_t fc;
+	int r, nt = 0, k, matched = 0;
+
+	memcpy(&fc, p + 24, 4);
+	fc = le32toh(fc);
+	for (r = 0; r < nroutes && nt < MAX_FANOUT; r++) {
+		struct route *rt = &routes[r];
+		const uint8_t *payload = p + VBAN_HDR;
+		unsigned eg;
+		if (cert ? strcmp(rt->src_cert, cert) != 0 : (rt->src_cert[0] || (rt->src_ip && rt->src_ip != sip)))
+			continue;      /* (a secure source is only passed in with the TX role, see secure_input) */
+		if (!rt->src_any_name && memcmp(rt->src_name, p + 8, NAME_LEN))
+			continue;
+		matched++;
+		memcpy(fw_hdrs[nt], p, VBAN_HDR);
+		if (!rt->dst_keep)
+			memcpy(fw_hdrs[nt] + 8, rt->dst_name, NAME_LEN);
+		eg = (rt->gain * master_gain + 50) / 100;   /* route x master, percent */
+		if (eg != 100 && apply_gain(fw_scratch[nt], p + VBAN_HDR, len - VBAN_HDR, p, eg))
+			payload = fw_scratch[nt];
+		memset(&fw_tx[nt], 0, sizeof(fw_tx[nt]));
+		if (rt->dst_cert[0]) {
+			vban_sec_peer_t *peer;
+			int sl;
+			if (!sec_on) {
+				st_sec_nopeer++;
+				continue;
+			}
+			if (!ms)
+				ms = mono_ms();
+			peer = sec_find(rt->dst_cert, ms);
+			if (!peer) {
+				st_sec_nopeer++;              /* the receiver has no session right now */
+				continue;
+			}
+			if (len > VBAN_SEC_INNER_MAX) {
+				st_sec_toobig++;              /* a 1464-byte plain packet does not fit the envelope */
+				continue;
+			}
+			memcpy(inner, fw_hdrs[nt], VBAN_HDR);
+			memcpy(inner + VBAN_HDR, payload, len - VBAN_HDR);
+			sl = vban_sec_seal(&peer->s, inner, len, ms, fw_sealed[nt], sizeof(fw_sealed[nt]));
+			if (sl < 0) {
+				st_sec_nopeer++;
+				continue;
+			}
+			fw_dst[nt].sin_family = AF_INET;
+			fw_dst[nt].sin_addr.s_addr = htonl(peer->addr.ip);
+			fw_dst[nt].sin_port = htons(peer->addr.port);
+			fw_iov[nt][0].iov_base = fw_sealed[nt];
+			fw_iov[nt][0].iov_len = (size_t)sl;
+			fw_tx[nt].msg_hdr.msg_iovlen = 1;
+			fw_tx[nt].msg_hdr.msg_name = &fw_dst[nt];
+		} else {
+			fw_iov[nt][0].iov_base = fw_hdrs[nt];
+			fw_iov[nt][0].iov_len = VBAN_HDR;
+			fw_iov[nt][1].iov_base = (void *)payload;
+			fw_iov[nt][1].iov_len = len - VBAN_HDR;
+			fw_tx[nt].msg_hdr.msg_iovlen = 2;
+			fw_tx[nt].msg_hdr.msg_name = &rt->dst;
+		}
+		fw_tx[nt].msg_hdr.msg_iov = fw_iov[nt];
+		fw_tx[nt].msg_hdr.msg_namelen = sizeof(struct sockaddr_in);
+		if (rt->have_fc && fc > rt->last_fc + 1 && fc - rt->last_fc < 100000)
+			rt->lost += fc - rt->last_fc - 1;
+		rt->last_fc = fc;
+		rt->have_fc = 1;
+		rt->pkts++;
+		rt->bytes += len;
+		rt->last_seen = now;
+		nt++;
+	}
+	if (nt) {
+		k = sendmmsg(fd, fw_tx, (unsigned)nt, MSG_DONTWAIT);
+		if (k < 0)
+			st_txerr += (uint64_t)nt;
+		else {
+			st_tx += (uint64_t)k;
+			st_txerr += (uint64_t)(nt - k);
+		}
+	}
+	return matched;
+}
+
+/* A USER packet with the secure marker: handshake or encrypted VBAN from a device. */
+static void secure_input(int fd, const uint8_t *p, unsigned len, const struct sockaddr_in *from, time_t now)
+{
+	static uint8_t out[VBAN_HDR + VBAN_MAX];
+	vban_addr_t a = { ntohl(from->sin_addr.s_addr), ntohs(from->sin_port) };
+	vban_sec_peer_t *peer;
+	int ev, n;
+
+	if (p[5] == VBAN_SEC_HS1 && !sec_hs_allowed(from->sin_addr.s_addr, now)) {
+		st_sec_hs_refused++;
+		return;
+	}
+	sec_id.now_unix = now > 1600000000 ? (uint64_t)now : 0;   /* dates only once NTP set the clock */
+	n = vban_sec_server_handle(&sec_srv, &sec_id, p, len, &a, mono_ms(), out, sizeof(out), &ev, &peer);
+	if (n < 0) {
+		if (n == VBAN_E_NOSPACE)
+			st_sec_hs_refused++;
+		else
+			st_sec_bad++;
+		return;
+	}
+	if (ev == VBAN_SEC_EV_SEND) {
+		sendto(fd, out, (size_t)n, 0, (const struct sockaddr *)from, sizeof(*from));
+	} else if (ev == VBAN_SEC_EV_DATA) {
+		struct sockaddr_in src = *from;
+		/* the inner packet is a VBAN packet from this peer; services and nested USER are not routed */
+		if ((unsigned)n < VBAN_HDR || memcmp(out, "VBAN", 4) || (out[4] & 0xE0) == 0x60 || (out[4] & 0xE0) == 0xE0) {
+			st_sec_bad++;
+			return;
+		}
+		if (!(peer->s.peer.role & VBAN_CERT_ROLE_TX)) {
+			st_sec_bad++;                 /* a receive-only certificate may not feed inputs */
+			return;
+		}
+		st_sec_rx++;
+		{
+			int m = forward(fd, out, (unsigned)n, src.sin_addr.s_addr, peer->s.peer.name, now);
+			note_stream(src.sin_addr.s_addr, src.sin_port, out, (unsigned)n, 0, m > 0, now);
+			note_stream_cert(peer->s.peer.name);
+		}
+	}
 }
 
 #ifdef VBANHUB_BPF
@@ -731,6 +1088,8 @@ static void bpf_sync_routes(void)
 	cfg.enabled = 0;
 	bpf_upd(m_cfg, &z, &cfg);
 	for (r = 0; r < nroutes; r++) {
+		if (routes[r].src_cert[0])
+			continue;
 		for (a = 0; a < nip && routes[r].src_ip && ips[a] != routes[r].src_ip; a++)
 			;
 		if (routes[r].src_ip && a == nip)
@@ -760,9 +1119,10 @@ static void bpf_sync_routes(void)
 				for (r = 0; r < nroutes; r++) {
 					struct route *rt = &routes[r];
 					struct vh_dst *d;
-					if (rt->dst_keep != keep || !bpf_route_matches(rt, key))
-						continue;
-					if ((rt->gain * master_gain + 50) / 100 != 100 || v->n >= VH_MAX_FO || r >= VH_MAX_ROUTES) {
+					if (rt->src_cert[0] || rt->dst_keep != keep || !bpf_route_matches(rt, key))
+						continue;          /* certificate-bound sources never match plain packets */
+					if ((rt->gain * master_gain + 50) / 100 != 100 || v->n >= VH_MAX_FO || r >= VH_MAX_ROUTES ||
+					    rt->dst_cert[0]) { /* encryption happens in the daemon */
 						v->slow = 1;  /* gain needs a payload copy, or too wide: daemon */
 						continue;
 					}
@@ -923,11 +1283,11 @@ static void dump_status(void)
 	f = fopen(tmp, "w");
 	if (!f)
 		return;
-	fprintf(f, "{\"uptime\":%ld,\"rx\":%llu,\"bad\":%llu,\"unknown\":%llu,\"tx\":%llu,\"txerr\":%llu,\"filtered\":%llu,\"master\":%u,"
+	fprintf(f, "{\"uptime\":%ld,\"rx\":%llu,\"bad\":%llu,\"unknown\":%llu,\"tx\":%llu,\"txerr\":%llu,\"filtered\":%llu,\"wan_refused\":%llu,\"master\":%u,"
 		"\"fastpath\":{\"on\":%d,\"to_daemon_gain\":%llu,\"to_daemon_unresolved\":%llu,\"to_daemon_gro\":%llu},\"listen\":[",
 		(long)(now - started), (unsigned long long)st_rx, (unsigned long long)st_bad,
 		(unsigned long long)st_unknown, (unsigned long long)st_tx, (unsigned long long)st_txerr,
-		(unsigned long long)st_filtered, master_gain, fastpath_on, (unsigned long long)st_kslow,
+		(unsigned long long)st_filtered, (unsigned long long)st_wan_refused, master_gain, fastpath_on, (unsigned long long)st_kslow,
 		(unsigned long long)st_knofib, (unsigned long long)st_kgso);
 	for (i = 0; i < nifaces; i++) {
 		fprintf(f, "%s{\"name\":", i ? "," : "");
@@ -950,6 +1310,10 @@ static void dump_status(void)
 			fputs("\"*\"", f);
 		else
 			json_name(f, r->dst_name, NAME_LEN);
+		fputs(",\"src_cert\":", f);
+		json_name(f, r->src_cert, VBAN_CERT_NAME_MAX);
+		fputs(",\"dst_cert\":", f);
+		json_name(f, r->dst_cert, VBAN_CERT_NAME_MAX);
 		fprintf(f, ",\"gain\":%u,\"pkts\":%llu,\"bytes\":%llu,\"lost\":%llu,\"age\":%ld}",
 			r->gain, (unsigned long long)(r->pkts + r->bpf_pkts), (unsigned long long)(r->bytes + r->bpf_bytes),
 			(unsigned long long)(r->lost + r->bpf_lost), r->last_seen ? (long)(now - r->last_seen) : -1L);
@@ -968,6 +1332,8 @@ static void dump_status(void)
 		}
 		fprintf(f, "%s{\"ip\":\"%s\",\"port\":%u,\"stream\":", i ? "," : "", inet_ntoa(a), s->port);
 		json_name(f, s->name, NAME_LEN);
+		fputs(",\"cert\":", f);
+		json_name(f, s->cert, VBAN_CERT_NAME_MAX);
 		fprintf(f, ",\"sub\":%u,\"hz\":%u,\"samples\":%u,\"channels\":%u,\"fmt\":%u,\"codec\":%u,"
 			"\"kind\":%u,\"routed\":%u,\"pkts\":%llu,\"bytes\":%llu,\"rate\":%u,\"age\":%ld}",
 			s->sr & 0xE0, idx < 21 ? sr_hz[idx] : 0, s->nbs + 1, s->nbc + 1, s->bit & 0x07, s->bit & 0xF0,
@@ -988,34 +1354,65 @@ static void dump_status(void)
 		json_name(f, disc[i].user, 64);
 		fprintf(f, ",\"age\":%ld}", (long)(now - disc[i].last_seen));
 	}
-	fprintf(f, "],\"scan\":{\"active\":%d,\"age\":%ld}}\n", now <= scan_until && last_scan,
+	fprintf(f, "],\"scan\":{\"active\":%d,\"age\":%ld},", now <= scan_until && last_scan,
 		last_scan ? (long)(now - last_scan) : -1L);
+	fprintf(f, "\"secure\":{\"on\":%d,\"rx\":%llu,\"bad\":%llu,\"hs_refused\":%llu,\"no_peer\":%llu,\"too_big\":%llu,"
+		"\"hub\":", sec_on, (unsigned long long)st_sec_rx, (unsigned long long)st_sec_bad,
+		(unsigned long long)st_sec_hs_refused, (unsigned long long)st_sec_nopeer, (unsigned long long)st_sec_toobig);
+	json_name(f, sec_on ? sec_id.cert.name : "", VBAN_CERT_NAME_MAX);
+	fputs(",\"peers\":[", f);
+	{
+		uint64_t ms = mono_ms();
+		int first = 1;
+		for (i = 0; sec_on && i < SEC_PEERS; i++) {
+			vban_sec_peer_t *p = &sec_peers[i];
+			struct in_addr pa;
+			if (p->s.state != VBAN_SEC_UP || ms - p->s.up_ms > VBAN_SEC_EXPIRE_MS)
+				continue;
+			pa.s_addr = htonl(p->addr.ip);
+			fprintf(f, "%s{\"name\":", first ? "" : ",");
+			json_name(f, p->s.peer.name, VBAN_CERT_NAME_MAX);
+			fprintf(f, ",\"role\":%u,\"serial\":\"%llu\",\"ip\":\"%s\",\"port\":%u,\"up\":%llu}", p->s.peer.role,
+				(unsigned long long)p->s.peer.serial, inet_ntoa(pa), p->addr.port,
+				(unsigned long long)((ms - p->s.up_ms) / 1000u));
+			first = 0;
+		}
+	}
+	fputs("]}}\n", f);
 	fclose(f);
 	rename(tmp, stat_path);
 }
 
+
+int vbanhub_cert_main(int argc, char **argv);   /* vbanhub_cert.c */
+
 int main(int argc, char **argv)
 {
 	static uint8_t bufs[BATCH][VBAN_MAX];
-	static uint8_t hdrs[MAX_FANOUT][VBAN_HDR];
-	static uint8_t scratch[MAX_FANOUT][VBAN_MAX];   /* gain-adjusted payload copies */
 	static char cbuf[BATCH][64];
 	struct sockaddr_in addrs[BATCH], me = { .sin_family = AF_INET };
-	struct mmsghdr rx[BATCH], tx[MAX_FANOUT];
-	struct iovec riov[BATCH], tiov[MAX_FANOUT][2];
+	struct mmsghdr rx[BATCH];
+	struct iovec riov[BATCH];
 	struct sigaction sa = { .sa_handler = on_sig }; /* no SA_RESTART */
 	int port = 6980, tos = 0xB8, rcvbuf = 65536, prio = 6, c, fd, i;
 	time_t last_dump = 0, last_resolve = 0, last_ifsync = 0;
 	const char *run_as = NULL;
 	struct pollfd pfd;
 
-	while ((c = getopt(argc, argv, "p:c:s:t:i:S:T:P:N:B:U:")) != -1) {
+	if (argc > 1 && !strcmp(argv[1], "cert"))
+		return vbanhub_cert_main(argc - 1, argv + 1);
+	while ((c = getopt(argc, argv, "p:c:s:t:i:S:T:P:N:B:U:K:W:")) != -1) {
 		switch (c) {
 		case 'S': scan_interval = atoi(optarg); break;
 #ifdef VBANHUB_BPF
 		case 'B': bpf_dir = optarg; break;   /* tc eBPF map pin directory */
 #endif
 		case 'U': run_as = optarg; break;    /* drop to this user after setup */
+		case 'K': pki_dir = optarg; break;   /* secure VBAN: CA / hub certificate directory */
+		case 'W':                            /* internet-facing interface: secure VBAN only */
+			if (nwan < MAX_IFACES)
+				wan_ifaces[nwan++] = optarg;
+			break;
 		case 'N': hub_name = optarg; break;
 		case 'T': {
 			struct in_addr a;
@@ -1044,7 +1441,7 @@ int main(int argc, char **argv)
 		case 's': stat_path = optarg; break;
 		case 't': tos = atoi(optarg) << 2; break; /* DSCP value */
 		default:
-			fprintf(stderr, "usage: %s [-p port] [-c conf] [-s statusfile] [-t dscp] [-B bpf_pin_dir] [-U user]\n", argv[0]);
+			fprintf(stderr, "usage: %s [-p port] [-c conf] [-s statusfile] [-t dscp] [-B bpf_pin_dir] [-U user] [-K pki_dir] [-W wan_ifname]\n       %s cert ...\n", argv[0], argv[0]);
 			return 1;
 		}
 	}
@@ -1083,6 +1480,7 @@ int main(int argc, char **argv)
 		bpf_sync_routes();
 	}
 #endif
+	sec_load();                       /* reads hub.key: before dropping privileges */
 	if (run_as && drop_privileges(run_as))
 		return 1;
 	pfd.fd = fd;
@@ -1092,7 +1490,7 @@ int main(int argc, char **argv)
 		int n;
 		time_t now = time(NULL);
 
-		if (nifaces && now - last_resolve >= 3) {  /* interfaces may appear later (e.g. after ifup) */
+		if ((nifaces || nwan) && now - last_resolve >= 3) {  /* interfaces may appear later (e.g. after ifup) */
 			resolve_ifaces();
 			last_resolve = now;
 		}
@@ -1107,6 +1505,10 @@ int main(int argc, char **argv)
 			want_reload = 0;
 			load_config();
 			bpf_sync_routes();
+			if (sec_on) {                 /* revocations apply at once */
+				sec_load_revoked();
+				sec_drop_revoked();
+			}
 		}
 		/* A requested scan (button / SIGUSR1) is never dropped: within 3 s of the previous scan it is
 		 * deferred to the next loop iteration (<= 1 s later) instead of being ignored. */
@@ -1138,14 +1540,24 @@ int main(int argc, char **argv)
 		for (i = 0; i < n; i++) {
 			uint8_t *p = bufs[i];
 			unsigned len = rx[i].msg_len;
-			uint32_t sip = addrs[i].sin_addr.s_addr, fc;
-			int k, nt = 0, r;
+			uint32_t sip = addrs[i].sin_addr.s_addr;
+			int nt;
 
 			uint32_t dstaddr;
 
-			if (!if_allowed(ingress_info(&rx[i].msg_hdr, &dstaddr))) {
-				st_filtered++;
-				continue;
+			{
+				int idx = ingress_info(&rx[i].msg_hdr, &dstaddr);
+				if (nwan && is_wan(idx)) {
+					/* internet: secure VBAN only, and only when secure VBAN is on */
+					if (!sec_on || rx[i].msg_len < VBAN_HDR || memcmp(p, "VBAN", 4) || (p[4] & 0xE0) != 0xE0 ||
+					    p[6] != 'S' || p[7] != 1) {
+						st_wan_refused++;
+						continue;
+					}
+				} else if (!if_allowed(idx)) {
+					st_filtered++;
+					continue;
+				}
 			}
 			st_rx++;
 			if ((rx[i].msg_hdr.msg_flags & MSG_TRUNC) || len < VBAN_HDR ||
@@ -1157,52 +1569,15 @@ int main(int argc, char **argv)
 				handle_service(fd, p, len, &addrs[i], now);
 				continue;
 			}
-			memcpy(&fc, p + 24, 4);
-			fc = le32toh(fc);
-			for (r = 0; r < nroutes && nt < MAX_FANOUT; r++) {
-				struct route *rt = &routes[r];
-				if (rt->src_ip && rt->src_ip != sip)
-					continue;
-				if (!rt->src_any_name && memcmp(rt->src_name, p + 8, NAME_LEN))
-					continue;
-				memcpy(hdrs[nt], p, VBAN_HDR);
-				if (!rt->dst_keep)
-					memcpy(hdrs[nt] + 8, rt->dst_name, NAME_LEN);
-				tiov[nt][0].iov_base = hdrs[nt];
-				tiov[nt][0].iov_len = VBAN_HDR;
-				tiov[nt][1].iov_base = p + VBAN_HDR;
-				tiov[nt][1].iov_len = len - VBAN_HDR;
-				{
-					unsigned eg = (rt->gain * master_gain + 50) / 100;   /* route x master, percent */
-					if (eg != 100 && apply_gain(scratch[nt], p + VBAN_HDR, len - VBAN_HDR, p, eg))
-						tiov[nt][1].iov_base = scratch[nt];
-				}
-				memset(&tx[nt], 0, sizeof(tx[nt]));
-				tx[nt].msg_hdr.msg_iov = tiov[nt];
-				tx[nt].msg_hdr.msg_iovlen = 2;
-				tx[nt].msg_hdr.msg_name = &rt->dst;
-				tx[nt].msg_hdr.msg_namelen = sizeof(rt->dst);
-				if (rt->have_fc && fc > rt->last_fc + 1 && fc - rt->last_fc < 100000)
-					rt->lost += fc - rt->last_fc - 1;
-				rt->last_fc = fc;
-				rt->have_fc = 1;
-				rt->pkts++;
-				rt->bytes += len;
-				rt->last_seen = now;
-				nt++;
-			}
-			note_stream(sip, addrs[i].sin_port, p, len, dst_kind(dstaddr), nt > 0, now);
-			if (!nt) {
-				st_unknown++;
+			if (sec_on && (p[4] & 0xE0) == 0xE0 && p[6] == 'S' && p[7] == 1) {   /* secure VBAN */
+				secure_input(fd, p, len, &addrs[i], now);
 				continue;
 			}
-			k = sendmmsg(fd, tx, nt, MSG_DONTWAIT);
-			if (k < 0)
-				st_txerr += nt;
-			else {
-				st_tx += k;
-				st_txerr += nt - k;
-			}
+			nt = forward(fd, p, len, sip, NULL, now);
+			note_stream(sip, addrs[i].sin_port, p, len, dst_kind(dstaddr), nt > 0, now);
+			note_stream_cert("");             /* heard in plain: not a secure stream */
+			if (!nt)
+				st_unknown++;
 		}
 	}
 #ifdef VBANHUB_BPF

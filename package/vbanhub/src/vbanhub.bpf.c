@@ -169,8 +169,9 @@ int vbanhub_ingress(struct __sk_buff *skb)
 	len = H16(h.ip.tot_len);
 	if (len < 20 + 8 + 28 || H16(h.udp.len) != len - 20)
 		return TC_ACT_OK;
-	if (h.vb[0] != 'V' || h.vb[1] != 'B' || h.vb[2] != 'A' || h.vb[3] != 'N' || (h.vb[4] & 0xE0) == 0x60)
-		return TC_ACT_OK;                       /* not VBAN, or SERVICE (the daemon answers pings) */
+	if (h.vb[0] != 'V' || h.vb[1] != 'B' || h.vb[2] != 'A' || h.vb[3] != 'N' || (h.vb[4] & 0xE0) == 0x60 ||
+	    ((h.vb[4] & 0xE0) == 0xE0 && h.vb[6] == 'S'))
+		return TC_ACT_OK;                       /* not VBAN, SERVICE (pings) or secure VBAN: the daemon's */
 
 	/* One lookup, most specific first. The daemon stores in each key every route that
 	 * matches it (including wildcard ones), so the first hit is the complete answer. */

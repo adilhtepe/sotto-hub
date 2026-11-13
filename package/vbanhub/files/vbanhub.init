@@ -3,14 +3,20 @@
 . /lib/functions/network.sh
 
 USE_PROCD=1
-EXTRA_COMMANDS="scan prune setvol"
+EXTRA_COMMANDS="scan prune setvol cert"
 EXTRA_HELP="	scan	Scan the LAN for VBAN devices (PING0)
 	prune	Delete routes whose endpoints no longer exist
-	setvol	<main|route-id|endpoint-id> <0-200> <0|1>  Set volume percent and mute, applied instantly"
+	setvol	<main|route-id|endpoint-id> <0-200> <0|1>  Set volume percent and mute, applied instantly
+	cert	<command ...>  Secure VBAN certificate authority (see vbanhub cert)"
 START=60
 STOP=10
 
 CONF=/var/etc/vbanhub.conf
+PKI=/etc/vbanhub/pki
+# LuCI writes uploaded files here (.req .crt .key), mode 0600, in a root-only directory: never in
+# the shared /tmp, where another local service could pre-create the file and read a CA key.
+UPLOAD_DIR=/etc/vbanhub/upload
+UPLOAD=$UPLOAD_DIR/upload
 
 # Volume of an endpoint (input or output) in percent: 0 when muted.
 ep_gain() {
@@ -24,7 +30,7 @@ ep_gain() {
 }
 
 gen_route() {
-	local from to sip sstream dip dport dstream en gain mute
+	local from to sip sstream dip dport dstream en gain mute scert dcert
 	config_get_bool en "$1" enabled 1
 	[ "$en" = 1 ] || return 0
 	config_get from "$1" from
@@ -36,14 +42,30 @@ gen_route() {
 	config_get dip "$to" ip
 	config_get dport "$to" port 6980
 	config_get dstream "$to" stream
+	# Secure VBAN: an endpoint with a certificate name is matched by that certificate (the
+	# device's encrypted session), not by IP; its IP is then optional.
+	config_get scert "$from" cert
+	config_get dcert "$to" cert
+	[ -n "$scert" ] && sip='*'
+	[ -n "$dcert" ] && { dip='*'; dport=0; }
 	[ -n "$sip" ] && [ -n "$dip" ] || return 0
+	case "$scert$dcert" in
+		*[\	]*|*"
+"*) logger -t vbanhub "route $1 skipped: certificate name has tab/newline"; return 0 ;;
+	esac
+	if [ ${#scert} -gt 32 ] || [ ${#dcert} -gt 32 ]; then
+		logger -t vbanhub "route $1 skipped: certificate name longer than 32"; return 0
+	fi
 	# The TAB-separated daemon config allows spaces in stream names. A stream name is OPTIONAL:
 	#   input  empty -> '*'  = accept any stream from this IP
 	#   output empty -> '*'  = forward the name the input sent, unchanged
 	# User-typed names must not contain tabs/newlines, be '*', or exceed 16 bytes.
 	case "$sip$dip$dport" in
-		*[[:space:]]*|*'*'*) logger -t vbanhub "route $1 skipped: bad address"; return 0 ;;
+		*[[:space:]]*) logger -t vbanhub "route $1 skipped: bad address"; return 0 ;;
 	esac
+	if { [ "$sip" = '*' ] && [ -z "$scert" ]; } || { [ "$dip" = '*' ] && [ -z "$dcert" ]; }; then
+		logger -t vbanhub "route $1 skipped: bad address"; return 0
+	fi
 	local tab="$(printf '\t')" nl="
 "
 	case "$sstream$dstream" in
@@ -63,7 +85,8 @@ gen_route() {
 	# effective volume = route x input x output (percent); the daemon accepts up to 400
 	gain=$((gain * $(ep_gain "$from") * $(ep_gain "$to") / 10000))
 	[ "$gain" -gt 400 ] && gain=400
-	printf 'route\t%s\t%s\t%s\t%s\t%s\t%s\n' "$sip" "$sstream" "$dip" "$dport" "$dstream" "$gain" >> $CONF
+	printf 'route\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$sip" "$sstream" "$dip" "$dport" "$dstream" "$gain" \
+		"$scert" "$dcert" >> $CONF
 }
 
 gen_conf() {
@@ -134,6 +157,12 @@ fw_sync() {   # $1 = port to open, or empty to remove all vbanhub rules
 	local have sec zone port
 	FW_PORT="$1"; FW_WANT=""; FW_WANT_ZONES=""
 	[ -n "$FW_PORT" ] && config_list_foreach main network fw_collect
+	# Internet (opt-in, secure VBAN only): open the port in the zone of the internet network.
+	# The daemon accepts nothing but authenticated, encrypted packets there (-W).
+	if [ -n "$FW_PORT" ] && [ -n "$INTERNET_ZONE" ]; then
+		FW_WANT="$FW_WANT
+vbanhub_internet $INTERNET_ZONE $FW_PORT"
+	fi
 	have="$(for sec in $(fw_rule_secs); do
 		echo "$sec $(uci -q get firewall.$sec.src) $(uci -q get firewall.$sec.dest_port)"; done | sort)"
 	[ "$have" = "$(echo "$FW_WANT" | sed '/^$/d' | sort)" ] && return 0
@@ -282,6 +311,54 @@ setvol() {
 	reload_service
 }
 
+# Certificate authority for secure VBAN (LuCI Security tab). File arguments may only be the
+# fixed upload paths. Commands that change the hub's identity restart the service; a
+# revocation reloads it (live sessions of the revoked device end at once).
+cert() {
+	local c="$1" days
+	shift
+	mkdir -p /etc/vbanhub
+	case "$c" in
+		prepare)     # called by LuCI before it writes an upload
+			mkdir -p $UPLOAD_DIR && chown root:root $UPLOAD_DIR && chmod 0700 $UPLOAD_DIR
+			rm -f $UPLOAD.req $UPLOAD.crt $UPLOAD.key ;;
+		status|export-ca)
+			/usr/sbin/vbanhub cert "$c" ;;
+		init)        # <ca name> <years> <hub name>
+			/usr/sbin/vbanhub cert init "$1" "$2" "$3" && restart >/dev/null 2>&1 ;;
+		import)      # <hub name> [withkey]
+			if [ "$2" = withkey ]; then
+				/usr/sbin/vbanhub cert import $UPLOAD.crt $UPLOAD.key "$1"
+			else
+				/usr/sbin/vbanhub cert import $UPLOAD.crt "$1"
+			fi
+			local r=$?
+			rm -f $UPLOAD.key $UPLOAD.crt
+			[ $r = 0 ] && restart >/dev/null 2>&1
+			return $r ;;
+		hub-cert)
+			/usr/sbin/vbanhub cert hub-cert $UPLOAD.crt && restart >/dev/null 2>&1
+			rm -f $UPLOAD.crt ;;
+		hub-renew)   # <hub name> <days>
+			/usr/sbin/vbanhub cert hub-renew "$1" "$2" && restart >/dev/null 2>&1 ;;
+		hub-request)
+			cat $PKI/hub.req ;;
+		sign)        # <days>, request in $UPLOAD.req
+			/usr/sbin/vbanhub cert sign $UPLOAD.req "$1"
+			local r=$?
+			rm -f $UPLOAD.req
+			return $r ;;
+		revoke)      # <serial>
+			case "$1" in ''|*[!0-9]*) echo "bad serial" >&2; return 1 ;; esac
+			/usr/sbin/vbanhub cert revoke "$1" && procd_send_signal vbanhub ;;
+		reset)
+			/usr/sbin/vbanhub cert reset && restart >/dev/null 2>&1 ;;
+		*)
+			echo "cert: prepare | status | export-ca | init <ca> <years> <hub> | import <hub> [withkey] | hub-cert | hub-renew <hub> <days> | hub-request | sign <days> | revoke <serial> | reset" >&2
+			return 2 ;;
+	esac
+}
+
 reload_service() {
 	prune_routes
 	# Changed settings (port, networks, scan, name...) or a service that is not running yet (just enabled
@@ -312,6 +389,18 @@ start_service() {
 	fi
 	gen_conf
 	gen_mdns "$mdns" "$port"
+	# Secure VBAN over the internet: only with a hub certificate, and only when asked for.
+	local internet inet_net inet_dev z
+	INTERNET_ZONE=""; inet_dev=""
+	config_get_bool internet main internet 0
+	config_get inet_net main internet_network wan
+	if [ "$internet" = 1 ] && [ -s $PKI/hub.crt ] && [ -s $PKI/hub.key ]; then
+		network_get_device inet_dev "$inet_net"
+		[ -n "$inet_dev" ] || inet_dev="$(uci -q get network."$inet_net".device)"
+		z="$(zone_of_net "$inet_net")" && INTERNET_ZONE="$(uci -q get "firewall.@zone[$z].name")"
+	elif [ "$internet" = 1 ]; then
+		logger -t vbanhub "internet access needs secure VBAN: create a CA in the Security tab first"
+	fi
 	config_get_bool openfw main open_firewall 1
 	if [ "$openfw" = 1 ]; then fw_sync "$port"; else fw_sync ""; fi
 
@@ -350,13 +439,27 @@ start_service() {
 	config_list_foreach main scan_target append_target
 	# Kernel fast path if installed and enabled: the daemon starts as root to open the pinned maps,
 	# then drops to nobody keeping only CAP_BPF. Otherwise procd starts it as nobody directly.
+	# Kernel fast path and/or secure VBAN: the daemon starts as root (to open the pinned maps and
+	# read hub.key), then drops to nobody (keeping only CAP_BPF for the maps). Otherwise procd
+	# starts it as nobody directly.
+	local asroot=0
 	config_get_bool fastpath main fastpath 1
 	if [ "$fastpath" = 1 ] && [ -n "$NET_DEVS" ] && fastpath_on $NET_DEVS; then
 		config_get_bool gro_off main fastpath_gro_off 1
 		[ "$gro_off" = 1 ] && command -v ethtool >/dev/null 2>&1 && gro_list_off $NET_DEVS
-		procd_append_param command -B $BPF_PIN -U nobody
+		procd_append_param command -B $BPF_PIN
+		asroot=1
 	else
 		fastpath_off
+	fi
+	if [ -s $PKI/hub.crt ] && [ -s $PKI/hub.key ]; then
+		procd_append_param command -K $PKI
+		[ -n "$inet_dev" ] && procd_append_param command -W "$inet_dev"
+		asroot=1
+	fi
+	if [ "$asroot" = 1 ]; then
+		procd_append_param command -U nobody
+	else
 		procd_set_param user nobody
 	fi
 	procd_set_param respawn

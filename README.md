@@ -4,14 +4,18 @@ A RAM-light VBAN router for OpenWrt. Transmitters send to the router; the router
 fans each stream out to any set of receivers, rewriting the VBAN stream name per
 receiver. Routing is configured in a LuCI matrix.
 
-## Why there is no "certificate"
-VBAN is plain UDP with no handshake, auth or encryption, and existing clients
-(VoiceMeeter, VBAN apps) only know IP + port + stream name. So "joining" is:
+## Certificates: plain VBAN vs secure VBAN
+Plain VBAN is UDP with no handshake, authentication or encryption. Existing clients (Voicemeeter,
+VBAN apps) know only IP + port + stream name, so for them "joining" is:
 
 1. **Enrollment**: you give each endpoint the router IP, hub port and its stream name.
 2. **Learn/adopt**: unknown senders appear in LuCI (IP, stream) with an "Adopt" button.
 3. **Binding**: a route only matches `(source IP, stream name)`; everything else is
    dropped and shown as "unrouted". For untrusted networks tunnel via WireGuard.
+
+Devices built on the VBAN SDK can use **secure VBAN** instead: certificates from a CA on this router,
+an authenticated and encrypted session with the hub, and routes bound to the certificate rather
+than the spoofable IP. See "Secure VBAN" below.
 
 ## Stream names and formats
 The hub reads the 28-byte header of every stream that reaches it (sent to the router or broadcast on the LAN
@@ -27,9 +31,10 @@ The daemon route file is now TAB-separated (`route<TAB>ip<TAB>stream<TAB>ip<TAB>
 ## Stream names are optional
 VBAN receivers filter on the stream name, but the hub does not need you to type one. An **input** (transmitter) with no name accepts any stream from its IP (set a name only to pick one of several streams the same IP sends). An **output** (receiver) with no name gets the name the input used, unchanged (set one only when the receiver accepts just one specific name, then the hub rewrites it). Internally `*` means "any" / "keep"; typing `*` as a name is rejected. If one IP sends several streams to the same unnamed-input route they are all forwarded; name the input to pick one. Test: `test/test_names.py <binary>`.
 
-## LuCI page: two tabs
-- **Mixer** (first tab): only the *Inputs* (transmitters) and *Outputs* (receivers), each with its own live state (signal/format/pkt/s or receiving/idle), who it is routed to, and its own volume + mute slider; plus the master volume.
+## LuCI page: three tabs
+- **Mixer** (first tab): only the *Inputs* (transmitters) and *Outputs* (receivers), each with its own live state (signal/format/pkt/s or receiving/idle), who it is routed to, and its own volume + mute slider; plus the master volume. Secure endpoints show a lock and their certificate name.
 - **Settings**: everything else (hub settings, routes, endpoints, routing matrix, devices on the router, discovery, streams heard, status).
+- **Security**: the certificate authority for secure VBAN (next section).
 
 ## Volume
 Volume exists per input, per output, per route and as a master; the effective level is their product (input x output x route x master; 0-150 % per slider, up to 400 % combined, any mute gives silence). Sliders apply instantly with `/etc/init.d/vbanhub setvol <main|route-id|endpoint-id> <0-200> <0|1>` (validated, committed, config re-read without restart or dropped packets). The hub scales PCM audio: uint8, int16, int24, int32 (fixed point, saturating) and float32/64; serial/text, non-PCM codecs and 12/10-bit data pass through unchanged. At 100 % a packet is forwarded bit-exact without a copy; only scaled routes pay for a payload copy (up to 45 KB of static buffers). UCI: `option gain`/`mute` on `route`, `endpoint` or `main` sections. Tests: `test/test_gain.py`, `node test/test_luci_render.js <hub.js>`.
@@ -176,9 +181,110 @@ the next packet through the kernel can overtake them. Receivers' jitter buffers 
 **Not verified yet:** the OpenWrt SDK build of `vbanhub-fastpath` (`bpf.mk`), and kernels 5.15 /
 6.6. The object also compiles for big-endian (`bpfeb`, MIPS).
 
+## Secure VBAN
+The hub is the responder of the SDK's secure VBAN (ADR-003 in the SDK):
+- **Handshake.** `Noise_XX_25519_ChaChaPoly_BLAKE2b` with 168-byte certificates.
+- **Packets.** ChaCha20-Poly1305 in VBAN `USER` packets, with replay protection and a rekey every
+  2 minutes.
+- **Code.** The crypto is the SDK's layer with Monocypher, copied unmodified into
+  `package/vbanhub/src/secure/` by `tools/sync-secure.sh`. `SDK_REVISION` records the SDK commit.
+
+**Security tab (LuCI).** It can:
+- create a CA on the router, or import one (its certificate, plus the key if the router should
+  sign); without the key, the router shows a hub request to sign elsewhere and upload back;
+- sign device requests: upload or paste the `.req`, then download the certificate and `ca.crt`;
+- list issued certificates, revoke them, and show the connected secure devices.
+
+The PKI lives in `/etc/vbanhub/pki`. Keys are `0600 root`. Uploads from LuCI are written with mode
+0600 to `/etc/vbanhub/upload` (root-only, `0700`) and deleted after use. They never go to the shared
+`/tmp`, where another local service could pre-create the file and read a CA key. A device name can
+hold only one live certificate (`sign` refuses a duplicate until the old one is revoked or expired),
+because routes are bound to certificate names. The PKI is kept over sysupgrade
+(`/lib/upgrade/keep.d/vbanhub`). The same actions are available on the command line:
+`/etc/init.d/vbanhub cert status | init | import | sign | revoke | reset ...`, which runs
+`vbanhub cert ...`.
+
+**Endpoints.** An endpoint with a **Certificate (secure)** name is matched by that certificate,
+so its IP is optional:
+- *As an input:* only packets from that device's authenticated session are routed. Plain packets
+  claiming its stream are not, so IP spoofing is gone.
+- *As an output:* packets are encrypted into the session the receiver device opened to the hub
+  (`vban_recv --hub router-ip ...`). Without a live session they are dropped and counted.
+- *Bridging:* secure → plain (e.g. to Voicemeeter), plain → secure and secure → secure all work.
+  Volume applies as usual.
+
+**Daemon.**
+- `-K <pki dir>` turns secure VBAN on. The daemon reads `hub.key` while still root, then drops to
+  `nobody`.
+- Reload (`SIGHUP`) re-reads the revocation list and ends the live sessions of revoked devices
+  at once.
+- Each address may start 3 handshakes per second. There are 64 session slots; a device holds two
+  for up to 60 s around each rekey.
+- **Floods.** When the 10-per-second handshake budget is used up, a handshake start gets a 44-byte
+  COOKIE reply instead of any work: a MAC of its source address under a key that rotates every
+  2 minutes. A device that is really at that address resends with the cookie and gets in on a
+  second budget. Floods from forged addresses cannot use that second budget. When the table is
+  full, the oldest unfinished handshake is evicted; established sessions never are.
+- **Measured.** With a flood from 60 source addresses at about 1200 handshakes/s, a real device
+  connected in 0.4–2 s, against 4.4–6 s before cookies.
+- **Revocation.** The list has no size limit; it is read whole and binary-searched.
+- **Roles.** A receive-only certificate cannot feed an input.
+- Secure packets always go through the daemon: the eBPF fast path passes them up, and secure
+  routes never enter its maps.
+- An inner packet may be at most 1420 bytes, so a full-size 1464-byte plain packet cannot go
+  to a secure output (`too_big`).
+
+**Tests.**
+- `test/test_secure.py <vbanhub> <SDK build>`, on loopback: CA init/sign/revoke; secure → plain,
+  secure → secure, plain → secure; plain packets claiming a certificate-bound stream not routed;
+  the status lists peers; a revoked sender is cut off.
+- `test/test_secure_router.py`, on the RT-AX52, run as a second instance in `/tmp` with a
+  throw-away CA. The live hub and `/etc/vbanhub` were not touched. Results:
+  - 8 secure transmitters (6000 packets/s in) were decrypted and bridged to a plain receiver, and
+    one was re-encrypted to a secure receiver;
+  - the daemon used 24 % of an A53 core (about 20 µs more per packet than plain forwarding);
+  - running as `nobody`, it cut a revoked transmitter off on reload;
+  - 8 devices starting at once from one address hit the 3/s handshake limit; the refused ones got
+    in on their 1 s retry.
+
+**Not verified yet.** The LuCI Security tab was checked by the render test only, not clicked
+through in a browser on the router. The init-script `cert` commands and the PKI in
+`/etc/vbanhub` were not used on the router; the router test called the binary directly. The
+OpenWrt SDK package build is also untested.
+
+## Over the internet
+Secure VBAN devices can reach the hub from anywhere. The hub then routes their audio like any
+other: to plain receivers on the LAN (Voicemeeter), and from LAN sources back out to them.
+- **Turning it on.** Opt in under Settings → *Secure devices from the internet*
+  (`option internet '1'`, `option internet_network 'wan'`). It needs a CA (Security tab).
+  The hub opens its port in that network's firewall zone and starts with `-W <wan device>`.
+  On that interface it accepts only authenticated, encrypted packets; plain VBAN and pings from
+  the internet are dropped and counted as `wan_refused`.
+- **NAT.** Devices always start the session, so a phone or laptop behind any home NAT works
+  without port forwarding on its side. A device that only receives sends a 44-byte keepalive every
+  15 s, so its NAT mapping stays open. The hub follows a device to a new address (e.g. when it
+  changes network) on its next authenticated packet.
+- **The hub's address.** The hub needs a public address on its WAN. Behind another router, forward
+  UDP 6980 to it. With a changing IP, use dynamic DNS: the SDK tools and `sotto` accept host
+  names (`--hub studio.example.net`). IPv4 only, like VBAN.
+- **Latency and loss.** Internet jitter is milliseconds, not microseconds. The receivers' jitter
+  buffer adapts by itself; start it higher (`-l 40`). Send with redundant copies (`-R 4`). Small
+  packets (64 frames, 284 bytes) stay far below any path MTU.
+
+**Tested** with `bench/vm-internet-test.sh`, in a VM with network namespaces. The path was hub WAN →
+"internet" (25 ms ± 8 ms delay, 1 % loss each way) → NAT router (UDP mappings expire after 20 s)
+→ home device. Results:
+- A secure transmitter behind NAT played a clean tone through the hub to a plain LAN receiver.
+  With `-R 4`, the redundant copies filled most of the gaps the loss and reordering opened.
+- A receive-only device behind NAT still got audio after 70 s: the keepalive held the 20 s
+  mapping.
+- 51 plain packets and a ping from the internet were refused; nothing was routed or answered.
+
+This has not been tried on a real internet link yet.
+
 ## Config flow
 UCI `/etc/config/vbanhub` -> init script writes `/var/etc/vbanhub.conf`
-(`route <src_ip> <src_stream> <dst_ip> <dst_port> <dst_stream>`) -> `SIGHUP`
+(`route <src_ip> <src_stream> <dst_ip> <dst_port> <dst_stream> <gain> <src_cert> <dst_cert>`, TAB-separated) -> `SIGHUP`
 reloads without restart. Daemon writes `/var/run/vbanhub.json` (tmpfs) every 2 s;
 LuCI reads it for live stats and the learn list.
 
@@ -205,5 +311,5 @@ Trust boundary: untrusted UDP on the hub port. VBAN has no auth, so source IP is
 - Destinations in 0.0.0.0/8, multicast/broadcast, or loopback on the hub port are refused (loop/reflection guard). The router's own LAN IP on the hub port is not yet checked.
 - Oversize (>1436 B) and non-VBAN datagrams are dropped, never forwarded.
 - Fan-out is capped at 32 destinations per packet. There is no per-source rate limit yet.
-- Residual risk: a host on the LAN can spoof an allowed transmitter's IP. Use a dedicated VLAN or WireGuard for untrusted clients.
+- Residual risk: a host on the LAN can spoof an allowed **plain** transmitter's IP. Use secure VBAN (certificate-bound endpoints) for SDK devices, and a dedicated VLAN or WireGuard for plain clients on untrusted networks.
 - Tests (`test/test_fanout.py`) cover source binding, oversize drop and loop refusal. Not run: gitleaks (not installed here), firewall rules, hardware.

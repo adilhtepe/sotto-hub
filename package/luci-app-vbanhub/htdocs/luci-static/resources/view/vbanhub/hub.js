@@ -140,6 +140,45 @@ function typeLabel(t) {
 
 function ago(s) { return s < 0 ? '-' : s + 's ago'; }
 
+/* ---- secure VBAN: the hub's certificate authority (vbanhub cert, via the init script) ---- */
+var UPLOAD = '/etc/vbanhub/upload/upload';
+
+/* Uploads go to a root-only directory, mode 0600 (never the shared /tmp). */
+function upload(ext, text) {
+	return certCmd([ 'prepare' ]).then(function() { return fs.write(UPLOAD + ext, text, 384 /* 0600 */); });
+}
+
+function certCmd(args) {
+	return fs.exec('/etc/init.d/vbanhub', [ 'cert' ].concat(args)).then(function(r) {
+		if (r.code)
+			throw new Error((r.stderr || '').trim() || _('failed (%d)').format(r.code));
+		return r.stdout || '';
+	});
+}
+
+function dateOf(t) { return t > 32503680000 ? _('never') : new Date(t * 1000).toISOString().slice(0, 10); }
+
+function download(name, text) {
+	var a = E('a', { href: URL.createObjectURL(new Blob([ text ], { type: 'application/x-pem-file' })), download: name });
+	document.body.appendChild(a); a.click(); a.remove();
+}
+
+/* A file chooser that reads a small text file in the browser; nothing leaves it until used. */
+function fileInput(onText) {
+	var inp = E('input', { type: 'file', accept: '.req,.crt,.key,.pem,.txt' });
+	inp.addEventListener('change', function() {
+		var f = inp.files[0];
+		if (!f) return onText(null);
+		if (f.size > 4096) { ui.addNotification(null, E('p', _('That file is too large for a VBAN key or certificate.')), 'warning'); return; }
+		var r = new FileReader();
+		r.onload = function() { onText(String(r.result)); };
+		r.readAsText(f);
+	});
+	return inp;
+}
+
+function notifyErr(e) { ui.addNotification(null, E('p', (e && e.message) || String(e)), 'danger'); }
+
 return view.extend({
 	load: function() {
 		return Promise.all([ uci.load('vbanhub'), readStatus(), L.resolveDefault(callHostHints(), {}) ]);
@@ -216,10 +255,11 @@ return view.extend({
 		var inputs = eps.filter(function(e) { return e.role !== 'rx'; }).map(function(e) {
 			return E('tr', { 'class': 'tr' }, [
 				E('td', { 'class': 'td' }, E('strong', {}, e.name || e.ip)),
-				E('td', { 'class': 'td' }, e.ip),
+				E('td', { 'class': 'td' }, e.cert ? '🔒 ' + e.cert : e.ip),
 				E('td', { 'class': 'td' }, e.stream || E('em', {}, _('any'))),
 				E('td', { 'class': 'td' }, liveCell(function(s) {
-					var hs = (s.streams || []).filter(function(x) { return x.ip === e.ip && (!e.stream || x.stream === e.stream); })
+					var hs = (s.streams || []).filter(function(x) {
+						return (e.cert ? x.cert === e.cert : (x.ip === e.ip && !x.cert)) && (!e.stream || x.stream === e.stream); })
 						.sort(function(a, b) { return a.age - b.age; });
 					if (!hs.length) return { on: false, text: _('no signal') };
 					var h = hs[0], on = h.age <= 3;
@@ -235,10 +275,13 @@ return view.extend({
 			var port = +(e.port || 6980);
 			return E('tr', { 'class': 'tr' }, [
 				E('td', { 'class': 'td' }, E('strong', {}, e.name || e.ip)),
-				E('td', { 'class': 'td' }, e.ip + ':' + port),
+				E('td', { 'class': 'td' }, e.cert ? '🔒 ' + e.cert : e.ip + ':' + port),
 				E('td', { 'class': 'td' }, e.stream || E('em', {}, _('same as input'))),
 				E('td', { 'class': 'td' }, liveCell(function(s) {
-					var rs = (s.routes || []).filter(function(r) { return r.dst === e.ip && r.dst_port === port && r.dst_stream === (e.stream || '*'); });
+					if (e.cert && !((s.secure && s.secure.peers) || []).some(function(x) { return x.name === e.cert; }))
+						return { on: false, text: _('not connected (secure)') };
+					var rs = (s.routes || []).filter(function(r) {
+						return (e.cert ? r.dst_cert === e.cert : (r.dst === e.ip && r.dst_port === port)) && r.dst_stream === (e.stream || '*'); });
 					var ages = rs.map(function(r) { return r.age; }).filter(function(a) { return a >= 0; });
 					var on = ages.some(function(a) { return a <= 3; });
 					if (!rs.length) return { on: false, text: _('no input routed') };
@@ -262,6 +305,141 @@ return view.extend({
 			tbl([ _('Name'), _('Address'), _('Stream'), _('State'), _('Receives from'), _('Volume') ], outputs,
 				_('No outputs yet. Add receivers in the Settings tab.'))
 		]);
+	},
+
+	/* Tab 3: secure VBAN. Built from `vbanhub cert status`; every action re-renders it. */
+	renderSecurity: function(st) {
+		var self = this, box = this.secBox;
+		box.innerHTML = '';
+		box.appendChild(E('p', { 'class': 'spinning' }, _('Loading…')));
+		return certCmd([ 'status' ]).then(function(out) {
+			var cs = JSON.parse(out || '{}');
+			box.innerHTML = '';
+			box.appendChild(self.securityContent(cs, st || self.lastSt || {}));
+		}).catch(function(e) {
+			box.innerHTML = '';
+			box.appendChild(E('div', { 'class': 'alert-message warning' }, _('Certificate tools are not available: %s').format(e.message)));
+		});
+	},
+
+	securityContent: function(cs, st) {
+		var self = this;
+		function row(t, w, d) {
+			return E('div', { 'class': 'cbi-value' }, [ E('label', { 'class': 'cbi-value-title' }, t),
+				E('div', { 'class': 'cbi-value-field' }, [ w, d ? E('div', { 'class': 'cbi-value-description' }, d) : '' ]) ]);
+		}
+		function act(label, cls, fn) {
+			return E('button', { 'class': 'cbi-button ' + (cls || ''), 'click': ui.createHandlerFn(self, function() {
+				return fn().then(function(go) { if (go !== false) return self.renderSecurity(); }).catch(notifyErr);
+			}) }, label);
+		}
+		function th(list) { return E('tr', { 'class': 'tr table-titles' }, list.map(function(t) { return E('th', { 'class': 'th' }, t); })); }
+		function td(x) { return E('td', { 'class': 'td' }, x); }
+		var hostname = (uci.get('vbanhub', 'main', 'hub_name') || 'VBAN hub').slice(0, 32);
+		var intro = E('p', { 'class': 'cbi-section-descr' }, _('Secure VBAN authenticates and encrypts audio between this hub and devices built on the VBAN SDK (PC, Android, ESP32). Every device has its own key and a certificate signed by your certificate authority (CA). Voicemeeter and other plain devices keep working unencrypted: the hub bridges between them.'));
+
+		if (!cs.ca) {
+			var caName = E('input', { 'class': 'cbi-input-text', type: 'text', maxlength: 32, value: 'Studio CA' });
+			var years = E('input', { 'class': 'cbi-input-text', type: 'number', min: 1, max: 50, value: 10 });
+			var hubName = E('input', { 'class': 'cbi-input-text', type: 'text', maxlength: 32, value: hostname });
+			var crtText = null, keyText = null;
+			return E('div', {}, [ intro,
+				E('h3', {}, _('Create a certificate authority on this router')),
+				row(_('CA name'), caName), row(_('Valid for (years)'), years),
+				row(_('Hub name'), hubName, _('The name devices see when they connect.')),
+				E('p', {}, act(_('Create CA'), 'cbi-button-positive', function() {
+					return certCmd([ 'init', caName.value, String(years.value), hubName.value ]);
+				})),
+				E('h3', {}, _('Or use an existing CA')),
+				E('p', { 'class': 'cbi-section-descr' }, _('Upload its certificate (ca.crt from vban_cert ca). Add its key (ca.key) if this router should sign device certificates; without the key the router shows a request that you sign with your CA and upload back.')),
+				row(_('CA certificate'), fileInput(function(t) { crtText = t; })),
+				row(_('CA key (optional)'), fileInput(function(t) { keyText = t; }), _('Stored on the router with mode 0600 and kept over upgrades.')),
+				E('p', {}, act(_('Import CA'), 'cbi-button-action', function() {
+					if (!crtText) return Promise.reject(new Error(_('Choose the CA certificate file first.')));
+					return upload('.crt', crtText).then(function() { return keyText ? fs.write(UPLOAD + '.key', keyText, 384) : null; }).then(function() { return certCmd([ 'import', hubName.value ].concat(keyText ? [ 'withkey' ] : [])); });
+				}))
+			]);
+		}
+
+		var running = st.secure && st.secure.on;
+		var parts = [ intro, E('h3', {}, _('Certificate authority')),
+			E('table', { 'class': 'table' }, [
+				E('tr', { 'class': 'tr' }, [ td(_('CA')), td(E('strong', {}, cs.ca.name)), td(_('fingerprint %s').format(cs.ca.fingerprint)),
+					td(_('valid until %s').format(dateOf(cs.ca.not_after))), td(cs.ca.has_key ? _('key on this router') : _('key kept elsewhere')) ]),
+				E('tr', { 'class': 'tr' }, [ td(_('Hub')), td(cs.hub ? E('strong', {}, cs.hub.name) : E('em', {}, _('no certificate yet'))),
+					td(cs.hub ? (cs.hub.valid ? _('valid') : E('span', { 'style': 'color:#d73a49' }, _('NOT valid for this CA or date'))) : ''),
+					td(cs.hub ? _('valid until %s').format(dateOf(cs.hub.not_after)) : ''),
+					td(running ? _('secure VBAN active') : _('not active: enable and start the hub')) ])
+			]),
+			E('p', {}, [
+				E('button', { 'class': 'cbi-button', 'click': function() { certCmd([ 'export-ca' ]).then(function(t) { download('ca.crt', t); }).catch(notifyErr); } }, _('Download CA certificate')), ' ',
+				cs.ca.has_key ? act(_('Renew hub certificate'), '', function() { return certCmd([ 'hub-renew', cs.hub ? cs.hub.name : hostname, '3650' ]); }) : '', ' ',
+				act(_('Remove CA…'), 'cbi-button-negative', function() {
+					if (!confirm(_('Delete the CA, the hub certificate and the list of issued certificates? Devices cannot connect securely until you set up a CA again.')))
+						return Promise.resolve(false);
+					return certCmd([ 'reset' ]);
+				})
+			]) ];
+
+		if (cs.hub_request) {
+			var signed = null;
+			parts.push(E('h3', {}, _('Hub certificate request')),
+				E('p', { 'class': 'cbi-section-descr' }, _('Sign this request with your CA (vban_cert sign ca.key ca.crt hub.req 3650 hub.crt) and upload the result.')),
+				E('p', {}, E('button', { 'class': 'cbi-button', 'click': function() { certCmd([ 'hub-request' ]).then(function(t) { download('hub.req', t); }).catch(notifyErr); } }, _('Download hub.req'))),
+				row(_('Signed hub certificate'), fileInput(function(t) { signed = t; })),
+				E('p', {}, act(_('Install hub certificate'), 'cbi-button-positive', function() {
+					if (!signed) return Promise.reject(new Error(_('Choose the certificate file first.')));
+					return upload('.crt', signed).then(function() { return certCmd([ 'hub-cert' ]); });
+				})));
+		}
+
+		if (cs.ca.has_key) {
+			var reqText = null, days = E('input', { 'class': 'cbi-input-text', type: 'number', min: 1, max: 36500, value: 365 });
+			var paste = E('textarea', { 'class': 'cbi-input-textarea', rows: 4, style: 'width:100%;font-family:monospace', placeholder: '-----BEGIN VBAN REQUEST-----' });
+			parts.push(E('h3', {}, _('Add a device')),
+				E('p', { 'class': 'cbi-section-descr' }, _('On the device: vban_cert key dev.key, then vban_cert req dev.key "Name" tx|rx|txrx dev.req. Upload or paste dev.req here and sign it. Give the device its certificate and ca.crt; its private key never leaves it. Then add an endpoint with this certificate name.')),
+				row(_('Request file'), fileInput(function(t) { reqText = t; if (t) paste.value = t; })),
+				row(_('… or paste it'), paste),
+				row(_('Valid for (days)'), days),
+				E('p', {}, act(_('Sign'), 'cbi-button-positive', function() {
+					var t = (paste.value || reqText || '').trim();
+					if (t.indexOf('BEGIN VBAN REQUEST') < 0) return Promise.reject(new Error(_('That is not a VBAN certificate request.')));
+					return upload('.req', t + '\n').then(function() { return certCmd([ 'sign', String(days.value) ]); }).then(function(crt) {
+						ui.showModal(_('Certificate issued'), [
+							E('p', {}, _('Give the device this certificate and the CA certificate.')),
+							E('textarea', { 'class': 'cbi-input-textarea', rows: 7, readonly: '', style: 'width:100%;font-family:monospace' }, crt),
+							E('div', { 'class': 'right' }, [
+								E('button', { 'class': 'cbi-button', 'click': function() { download('device.crt', crt); } }, _('Download device.crt')), ' ',
+								E('button', { 'class': 'cbi-button', 'click': function() { certCmd([ 'export-ca' ]).then(function(c) { download('ca.crt', c); }).catch(notifyErr); } }, _('Download ca.crt')), ' ',
+								E('button', { 'class': 'cbi-button cbi-button-positive', 'click': function() { ui.hideModal(); self.renderSecurity(); } }, _('Done'))
+							])
+						]);
+						return false;
+					});
+				})));
+		}
+
+		var peers = (st.secure && st.secure.peers) || [];
+		function online(name) { return peers.some(function(x) { return x.name === name; }); }
+		var issued = (cs.issued || []).slice().sort(function(a, b) { return a.name.localeCompare(b.name); });
+		parts.push(E('h3', {}, _('Device certificates')),
+			E('table', { 'class': 'table' }, [ th([ _('Name'), _('Role'), _('Serial'), _('Valid until'), _('State'), '' ]) ].concat(issued.length ? issued.map(function(c) {
+				return E('tr', { 'class': 'tr' }, [
+					td(E('strong', {}, c.name)), td(c.role.join(' + ')), td(c.serial), td(dateOf(c.not_after)),
+					td(c.revoked ? E('span', { 'style': 'color:#d73a49' }, _('revoked')) : (online(c.name) ? _('connected') : _('valid'))),
+					td(c.revoked ? '' : act(_('Revoke'), 'cbi-button-negative', function() {
+						if (!confirm(_('Revoke the certificate of "%s"? Its session ends now and it cannot connect again.').format(c.name))) return Promise.resolve(false);
+						return certCmd([ 'revoke', c.serial ]);
+					}))
+				]);
+			}) : [ E('tr', {}, E('td', { 'class': 'td', 'colspan': 6 }, E('em', {}, _('None yet.')))) ])),
+			E('h3', {}, _('Connected secure devices')),
+			E('table', { 'class': 'table' }, [ th([ _('Name'), _('Address'), _('Serial'), _('Session') ]) ].concat(peers.length ? peers.map(function(x) {
+				return E('tr', { 'class': 'tr' }, [ td(x.name), td(x.ip + ':' + x.port), td(x.serial), td(_('up %ds (rekeyed every 2 min)').format(x.up)) ]);
+			}) : [ E('tr', {}, E('td', { 'class': 'td', 'colspan': 4 }, E('em', {}, _('No device connected.')))) ])),
+			running ? E('p', { 'class': 'cbi-section-descr' }, _('Encrypted packets received: %d, rejected: %d, handshakes refused: %d, dropped for a secure output without session: %d.')
+				.format(st.secure.rx, st.secure.bad, st.secure.hs_refused, st.secure.no_peer)) : '');
+		return E('div', {}, parts);
 	},
 
 	updateMixer: function(st) {
@@ -413,6 +591,11 @@ return view.extend({
 		o = s.option(form.Flag, 'open_firewall', _('Open UDP port in firewall'),
 			_('Adds an accept rule for the port in the firewall zones of the selected networks (never WAN). Zones that already accept input, like the default LAN, need none.'));
 		o.default = '1';
+		o = s.option(form.Flag, 'internet', _('Secure devices from the internet'),
+			_('Lets devices with a certificate from this hub connect over the internet (create the CA in the Security tab first). Only authenticated, encrypted VBAN is accepted from that network; plain VBAN and pings never are. Opens the hub port in that network\'s firewall zone.'));
+		o.default = '0';
+		o = s.option(widgets.NetworkSelect, 'internet_network', _('Internet network'));
+		o.nocreate = true; o.default = 'wan'; o.depends('internet', '1');
 		o = s.option(form.Value, 'scan_interval', _('Auto-scan interval (s)'), _('0 = only when you press Scan LAN.'));
 		o.datatype = 'uinteger'; o.placeholder = '0';
 		o = s.option(form.Value, 'scan_ports', _('Scan ports'), _('Comma-separated UDP ports devices listen on.'));
@@ -452,8 +635,16 @@ return view.extend({
 		o = s.option(form.Value, 'name', _('Name'));
 		o = s.option(form.ListValue, 'role', _('Role'));
 		o.value('tx', _('Transmitter')); o.value('rx', _('Receiver')); o.default = 'tx';
-		o = s.option(form.Value, 'ip', _('IP address'));
-		o.datatype = 'ip4addr'; o.rmempty = false;
+		o = s.option(form.Value, 'ip', _('IP address'), _('Not needed for a secure endpoint: it is found by its certificate.'));
+		o.datatype = 'ip4addr'; o.rmempty = true;
+		o.validate = function(section_id, value) {
+			var c = this.map.lookupOption('cert', section_id);
+			var cert = c ? c[0].formvalue(section_id) : uci.get('vbanhub', section_id, 'cert');
+			return (value || cert) ? true : _('An IP address, or a certificate name for a secure device');
+		};
+		o = s.option(form.Value, 'cert', _('Certificate (secure)'), _('Secure VBAN: the name in this device\'s certificate (Security tab). Its audio is then accepted only from its encrypted session, from any address, and outputs to it are encrypted.'));
+		o.datatype = 'maxlength(32)'; o.rmempty = true;
+		o.validate = function(section_id, value) { return (value && /[\t\r\n]/.test(value)) ? _('No tabs or line breaks') : true; };
 		o = s.option(form.Value, 'port', _('Port (receivers)'));
 		o.datatype = 'port'; o.placeholder = '6980';
 		o.depends('role', 'rx');
@@ -484,6 +675,8 @@ return view.extend({
 				_('The VBAN hub is not running, so nothing is received or routed. Open the Settings tab, tick Enable and use Save & Apply (the service starts by itself).'));
 
 			/* initTabGroup() inserts the tab menu next to the group, so the group needs a parent already */
+			self.secBox = E('div');
+			self.renderSecurity(data[1]);
 			var tabs = E('div', {}, [
 				E('div', { 'data-tab': 'mixer', 'data-tab-title': _('Mixer') }, [ self.mixBanner, self.mixerBox ]),
 				E('div', { 'data-tab': 'settings', 'data-tab-title': _('Settings') }, [
@@ -493,7 +686,8 @@ return view.extend({
 					self.matrixBox,
 					E('h3', {}, _('Live status')),
 					statusBox
-				])
+				]),
+				E('div', { 'data-tab': 'security', 'data-tab-title': _('Security') }, [ self.secBox ])
 			]);
 			var page = E('div', {}, [ E('h2', {}, _('VBAN Hub')), tabs ]);
 			ui.tabs.initTabGroup(tabs.childNodes);

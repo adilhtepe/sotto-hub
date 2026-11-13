@@ -66,10 +66,11 @@ define Package/vbanhub-fastpath/install
 endef
 
 define Package/vbanhub/install
-	$(INSTALL_DIR) $(1)/usr/sbin $(1)/etc/init.d $(1)/etc/config
+	$(INSTALL_DIR) $(1)/usr/sbin $(1)/etc/init.d $(1)/etc/config $(1)/lib/upgrade/keep.d
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/vbanhub $(1)/usr/sbin/
 	$(INSTALL_BIN) ./files/vbanhub.init $(1)/etc/init.d/vbanhub
 	$(INSTALL_CONF) ./files/vbanhub.config $(1)/etc/config/vbanhub
+	$(INSTALL_DATA) ./files/vbanhub.keep $(1)/lib/upgrade/keep.d/vbanhub   # keep the secure-VBAN PKI over sysupgrade
 endef
 
 $(eval $(call BuildPackage,vbanhub))
