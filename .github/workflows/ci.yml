@@ -1,0 +1,33 @@
+name: ci
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  hub:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Secure layer is the SDK's, unmodified
+        run: sh tools/sync-secure.sh sdk && git diff --exit-code -- package/vbanhub/src/secure ':!package/vbanhub/src/secure/SDK_REVISION'
+      - name: Daemon
+        run: make -C package/vbanhub/src CFLAGS=-O2
+      - name: eBPF program (little and big endian)
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang
+          cd package/vbanhub/src
+          clang -O2 -g -Wall -target bpfel -I/usr/include/$(uname -m)-linux-gnu -c vbanhub.bpf.c -o vbanhub.bpf.o
+          clang -O2 -g -Wall -target bpfeb -I/usr/include/$(uname -m)-linux-gnu -c vbanhub.bpf.c -o vbanhub.bpfeb.o
+      - name: SDK tools for the secure tests
+        run: |
+          cmake -S sdk -B sdk-build -DCMAKE_BUILD_TYPE=Release -DVBAN_BUILD_TESTS=OFF -DVBAN_BUILD_BENCH=OFF
+          cmake --build sdk-build --parallel --target vban_send vban_recv vban_cert
+      - name: Tests
+        run: |
+          B=package/vbanhub/src/vbanhub
+          for t in test_fanout test_names test_streams test_gain test_iface test_discovery test_scan_defer; do
+            echo "== $t"; python3 test/$t.py $B
+          done
+          python3 test/test_secure.py $B sdk-build
+          node test/test_luci_render.js package/luci-app-vbanhub/htdocs/luci-static/resources/view/vbanhub/hub.js

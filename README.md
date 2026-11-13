@@ -313,3 +313,10 @@ Trust boundary: untrusted UDP on the hub port. VBAN has no auth, so source IP is
 - Fan-out is capped at 32 destinations per packet. There is no per-source rate limit yet.
 - Residual risk: a host on the LAN can spoof an allowed **plain** transmitter's IP. Use secure VBAN (certificate-bound endpoints) for SDK devices, and a dedicated VLAN or WireGuard for plain clients on untrusted networks.
 - Tests (`test/test_fanout.py`) cover source binding, oversize drop and loop refusal. Not run: gitleaks (not installed here), firewall rules, hardware.
+
+## Thanks
+This is part of **Sotto** (the `sotto` repository links all of its repositories). VBAN is the
+protocol of VB-Audio Software; Sotto is an independent implementation, not affiliated with
+VB-Audio. The full list of sources and thanks (reference implementations, Monocypher, miniaudio,
+Scream, Noise, the cacophony test vectors and the tools) is in the `sotto` repository's
+ACKNOWLEDGEMENTS.md.

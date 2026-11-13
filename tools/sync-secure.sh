@@ -2,7 +2,7 @@
 # Copy the secure-VBAN layer from the SDK (../SDK by default) into the hub package.
 # The hub compiles these files as they are; do not edit them here, change the SDK and re-sync.
 set -e
-SDK=${1:-$(dirname "$0")/../../SDK}
+SDK=${1:-$(dirname "$0")/../sdk}
 D=$(dirname "$0")/../package/vbanhub/src/secure
 mkdir -p "$D/vban" "$D/monocypher"
 cp "$SDK/src/vban_secure.c" "$SDK/src/vban_noise.c" "$D/"
