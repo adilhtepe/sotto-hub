@@ -12,7 +12,7 @@ S=package/vbanhub/src
 $CC -Os -c -w -o build/monocypher-aarch64.o $S/secure/monocypher/monocypher.c
 $CC -Os -static -s -Wall -Wextra -ffunction-sections -fdata-sections -Wl,--gc-sections \
 	-I$S/secure -I$S/secure/monocypher -o build/vbanhub-aarch64 \
-	$S/vbanhub.c $S/vbanhub_cert.c $S/secure/vban_secure.c $S/secure/vban_noise.c build/monocypher-aarch64.o
+	$S/vbanhub.c $S/vbanhub_mix.c $S/vbanhub_cert.c $S/secure/vban_secure.c $S/secure/vban_noise.c build/monocypher-aarch64.o
 
 clang -O2 -g -Wall -target bpfel -I/usr/include/$(uname -m)-linux-gnu -c package/vbanhub/src/vbanhub.bpf.c -o build/vbanhub.bpf.o   # little-endian (aarch64)
 

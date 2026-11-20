@@ -43,6 +43,7 @@
 #define VBANHUB_BPF 1
 #include "vbanhub_bpf.h"
 #endif
+#include "vbanhub_mix.h"
 
 #define VBAN_HDR 28
 #define VBAN_MAX 1436
@@ -66,6 +67,7 @@ struct route {
 	time_t last_seen;
 	unsigned gain;       /* effective route volume in percent (route x input x output), 100 = unchanged, 0 = mute */
 	int dst_keep;        /* destination stream name '*': forward the name the sender used, no rewrite */
+	int mix;             /* >0: this route feeds mixer output (mix-1) instead of being forwarded as is */
 	uint64_t bpf_pkts, bpf_bytes, bpf_lost;   /* forwarded by the kernel fast path */
 };
 
@@ -189,6 +191,9 @@ static int load_config(void)
 	char line[256];
 	int n = 0;
 
+	struct mix_dst mixd[MIX_MAX_OUT];
+	int nmix = 0, i;
+
 	master_gain = 100;
 
 	if (!f)
@@ -209,6 +214,25 @@ static int load_config(void)
 		if (!strncmp(line, "master\t", 7)) {
 			int g = atoi(line + 7);
 			master_gain = g < 0 ? 0 : (g > 200 ? 200 : g);
+			continue;
+		}
+		/* mixdst \t ip \t port \t stream: this receiver gets ONE mixed stream (see vbanhub_mix.h) */
+		if (!strncmp(line, "mixdst\t", 7)) {
+			char *ip = line + 7, *port = strchr(ip, '\t'), *nm = NULL;
+			struct in_addr a;
+			if (port) {
+				*port++ = 0;
+				nm = strchr(port, '\t');
+				if (nm)
+					*nm++ = 0;
+			}
+			if (port && nmix < MIX_MAX_OUT && inet_aton(ip, &a) && atoi(port) > 0 && atoi(port) < 65536) {
+				memset(&mixd[nmix], 0, sizeof(mixd[nmix]));
+				mixd[nmix].ip = a.s_addr;
+				mixd[nmix].port = htons((uint16_t)atoi(port));
+				set_name(mixd[nmix].name, nm && *nm ? nm : "Mix");
+				nmix++;
+			}
 			continue;
 		}
 		while (nf < 9) {
@@ -281,6 +305,11 @@ names:
 	}
 	fclose(f);
 	nroutes = n;
+	mix_sync(mixd, nmix);
+	for (i = 0; i < n; i++) {   /* a plain (not secure) receiver listed as mixed: its routes feed the mixer */
+		int o = routes[i].dst_cert[0] ? -1 : mix_find(routes[i].dst.sin_addr.s_addr, routes[i].dst.sin_port);
+		routes[i].mix = o >= 0 ? o + 1 : 0;
+	}
 	return n;
 }
 
@@ -808,6 +837,7 @@ static int sec_hs_allowed(uint32_t ip, time_t now)
 }
 
 /* ---- forwarding (plain and secure sources share it) ---- */
+static uint64_t g_now_ns;                              /* monotonic, set once per received batch */
 static uint8_t fw_hdrs[MAX_FANOUT][VBAN_HDR];
 static uint8_t fw_scratch[MAX_FANOUT][VBAN_MAX];     /* gain-adjusted payload copies */
 static uint8_t fw_sealed[MAX_FANOUT][VBAN_HDR + VBAN_MAX];
@@ -835,6 +865,17 @@ static int forward(int fd, uint8_t *p, unsigned len, uint32_t sip, const char *c
 		if (!rt->src_any_name && memcmp(rt->src_name, p + 8, NAME_LEN))
 			continue;
 		matched++;
+		if (rt->mix) {          /* a mixed receiver: summed with the other inputs, sent by mix_tick */
+			mix_feed(rt->mix - 1, sip, p, p + VBAN_HDR, len - VBAN_HDR, (rt->gain * master_gain + 50) / 100, g_now_ns);
+			if (rt->have_fc && fc > rt->last_fc + 1 && fc - rt->last_fc < 100000)
+				rt->lost += fc - rt->last_fc - 1;
+			rt->last_fc = fc;
+			rt->have_fc = 1;
+			rt->pkts++;
+			rt->bytes += len;
+			rt->last_seen = now;
+			continue;
+		}
 		memcpy(fw_hdrs[nt], p, VBAN_HDR);
 		if (!rt->dst_keep)
 			memcpy(fw_hdrs[nt] + 8, rt->dst_name, NAME_LEN);
@@ -1121,6 +1162,10 @@ static void bpf_sync_routes(void)
 					struct vh_dst *d;
 					if (rt->src_cert[0] || rt->dst_keep != keep || !bpf_route_matches(rt, key))
 						continue;          /* certificate-bound sources never match plain packets */
+					if (rt->mix) {         /* summed in the daemon */
+						v->slow = 1;
+						continue;
+					}
 					if ((rt->gain * master_gain + 50) / 100 != 100 || v->n >= VH_MAX_FO || r >= VH_MAX_ROUTES ||
 					    rt->dst_cert[0]) { /* encryption happens in the daemon */
 						v->slow = 1;  /* gain needs a payload copy, or too wide: daemon */
@@ -1356,6 +1401,24 @@ static void dump_status(void)
 	}
 	fprintf(f, "],\"scan\":{\"active\":%d,\"age\":%ld},", now <= scan_until && last_scan,
 		last_scan ? (long)(now - last_scan) : -1L);
+	fputs("\"mix\":[", f);
+	{
+		int o, first = 1;
+		struct mix_stats ms;
+		for (o = 0; o < MIX_MAX_OUT; o++) {
+			struct in_addr ma;
+			if (!mix_get_stats(o, &ms))
+				continue;
+			ma.s_addr = ms.ip;
+			fprintf(f, "%s{\"dst\":\"%s\",\"dst_port\":%u,\"stream\":", first ? "" : ",", inet_ntoa(ma), ntohs(ms.port));
+			json_name(f, ms.name, MIX_NAME);
+			fprintf(f, ",\"inputs\":%d,\"running\":%d,\"pkts\":%llu,\"under\":%llu,\"over\":%llu,\"unsupported\":%llu}",
+				ms.inputs, ms.running, (unsigned long long)ms.pkts, (unsigned long long)ms.under,
+				(unsigned long long)ms.over, (unsigned long long)ms.unsupported);
+			first = 0;
+		}
+	}
+	fputs("],", f);
 	fprintf(f, "\"secure\":{\"on\":%d,\"rx\":%llu,\"bad\":%llu,\"hs_refused\":%llu,\"no_peer\":%llu,\"too_big\":%llu,"
 		"\"hub\":", sec_on, (unsigned long long)st_sec_rx, (unsigned long long)st_sec_bad,
 		(unsigned long long)st_sec_hs_refused, (unsigned long long)st_sec_nopeer, (unsigned long long)st_sec_toobig);
@@ -1385,6 +1448,22 @@ static void dump_status(void)
 
 
 int vbanhub_cert_main(int argc, char **argv);   /* vbanhub_cert.c */
+
+static uint64_t now_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void mix_send(void *ctx, const struct sockaddr_in *dst, const uint8_t *buf, unsigned len)
+{
+	if (sendto(*(int *)ctx, buf, len, MSG_DONTWAIT, (const struct sockaddr *)dst, sizeof(*dst)) < 0)
+		st_txerr++;
+	else
+		st_tx++;
+}
 
 int main(int argc, char **argv)
 {
@@ -1522,8 +1601,26 @@ int main(int argc, char **argv)
 			dump_status();
 			last_dump = now;
 		}
-		if (poll(&pfd, 1, 1000) <= 0)
-			continue;
+		{
+			/* sleep until the next input packet, or until the mixer's next packet is due */
+			uint64_t dl = mix_deadline(), t = now_ns();
+			struct timespec to = { 1, 0 };
+			int pr;
+
+			if (dl) {
+				uint64_t w = dl > t ? dl - t : 0;
+				if (w < 1000000000ull) {
+					to.tv_sec = 0;
+					to.tv_nsec = (long)w;
+				}
+			}
+			pr = ppoll(&pfd, 1, &to, NULL);
+			g_now_ns = now_ns();
+			if (pr <= 0) {
+				mix_tick(g_now_ns, mix_send, &fd);
+				continue;
+			}
+		}
 
 		for (i = 0; i < BATCH; i++) {
 			riov[i].iov_base = bufs[i];
@@ -1579,6 +1676,7 @@ int main(int argc, char **argv)
 			if (!nt)
 				st_unknown++;
 		}
+		mix_tick(now_ns(), mix_send, &fd);
 	}
 #ifdef VBANHUB_BPF
 	if (bpf_dir) {   /* the program stays attached until the init script removes it: hand everything back */

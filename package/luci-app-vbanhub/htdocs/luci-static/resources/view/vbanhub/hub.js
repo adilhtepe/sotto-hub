@@ -91,8 +91,11 @@ function openAdd(pre) {
 	var dl = E('datalist', { id: 'vbanhub-streams' }, (pre.suggest || []).map(function(n) { return E('option', { value: n }); }));
 	var stream = E('input', { 'class': 'cbi-input-text', type: 'text', maxlength: 16, list: 'vbanhub-streams', value: pre.stream || '' });
 	var err = E('p', { 'class': 'alert-message', 'style': 'display:none' });
+	var mix = E('input', { type: 'checkbox' });
+	var mixRow = E('div', { 'class': 'cbi-value' }, [ E('label', { 'class': 'cbi-value-title' }, _('Mix inputs')),
+		E('div', { 'class': 'cbi-value-field' }, [ mix, E('div', { 'class': 'cbi-value-description' }, _('Sum everything routed to this receiver into ONE stream (48 kHz stereo). Use it for receivers that play a single stream at a time.')) ]) ]);
 	var portRow = E('div', { 'class': 'cbi-value' }, [ E('label', { 'class': 'cbi-value-title' }, _('Port (receivers)')), E('div', { 'class': 'cbi-value-field' }, port) ]);
-	function sync() { portRow.style.display = role.value === 'rx' ? '' : 'none'; }
+	function sync() { portRow.style.display = mixRow.style.display = role.value === 'rx' ? '' : 'none'; }
 	role.addEventListener('change', sync); sync();
 
 	function row(t, w, d) {
@@ -101,7 +104,7 @@ function openAdd(pre) {
 	}
 
 	ui.showModal(_('Add device'), [
-		row(_('Name'), name), row(_('Role'), role), row(_('IP address'), ip), portRow,
+		row(_('Name'), name), row(_('Role'), role), row(_('IP address'), ip), portRow, mixRow,
 		row(_('Stream name (optional)'), E('span', {}, [ stream, dl ]), _('Leave empty in most cases. Transmitter: empty = accept any stream from this IP; fill it only to pick one of several streams it sends. Receiver: empty = keep the name the transmitter used; fill it only if the receiver accepts just one specific name. Max 16 characters, spaces allowed.')),
 		err,
 		E('div', { 'class': 'right' }, [
@@ -117,6 +120,7 @@ function openAdd(pre) {
 				uci.set('vbanhub', id, 'role', role.value);
 				uci.set('vbanhub', id, 'ip', ip.value);
 				if (role.value === 'rx') uci.set('vbanhub', id, 'port', String(port.value));
+				if (role.value === 'rx' && mix.checked) uci.set('vbanhub', id, 'mix', '1');
 				if (stream.value) uci.set('vbanhub', id, 'stream', stream.value);
 				uci.save().then(function() { ui.hideModal(); location.reload(); });
 			} }, _('Add'))
@@ -276,7 +280,7 @@ return view.extend({
 			return E('tr', { 'class': 'tr' }, [
 				E('td', { 'class': 'td' }, E('strong', {}, e.name || e.ip)),
 				E('td', { 'class': 'td' }, e.cert ? '🔒 ' + e.cert : e.ip + ':' + port),
-				E('td', { 'class': 'td' }, e.stream || E('em', {}, _('same as input'))),
+				E('td', { 'class': 'td' }, e.mix === '1' && !e.cert ? (e.stream || 'Mix') + ' (' + _('mixed') + ')' : (e.stream || E('em', {}, _('same as input')))),
 				E('td', { 'class': 'td' }, liveCell(function(s) {
 					if (e.cert && !((s.secure && s.secure.peers) || []).some(function(x) { return x.name === e.cert; }))
 						return { on: false, text: _('not connected (secure)') };
@@ -656,6 +660,9 @@ return view.extend({
 			if (/[\t\r\n*]/.test(value)) return _('No tabs, line breaks or * in a stream name');
 			return true;
 		};
+
+		o = s.option(form.Flag, 'mix', _('Mix inputs into one stream'), _('Receiver only. Everything routed to this receiver is summed into ONE stream (48 kHz, stereo, 16-bit) instead of one stream per transmitter. Turn this on for receivers that play a single stream at a time (sotto, Voicemeeter), so two transmitters do not garble each other. The stream name above is used for the mixed stream (default "Mix"). Inputs must be 48 kHz PCM, mono or stereo.'));
+		o.depends('role', 'rx'); o.default = '0'; o.rmempty = true;
 
 		return m.render().then(function(mapNode) {
 			self.lastSt = data[1];

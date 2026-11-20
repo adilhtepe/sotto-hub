@@ -89,6 +89,27 @@ gen_route() {
 		"$scert" "$dcert" >> $CONF
 }
 
+# A receiver with 'option mix 1' gets ONE stream that is the sum of every transmitter routed to
+# it (daemon: vbanhub_mix.c; 48 kHz stereo s16), named by its 'stream' option (default 'Mix').
+gen_mix() {
+	local en role mix ip port stream cert tab nl
+	config_get role "$1" role
+	config_get_bool mix "$1" mix 0
+	config_get cert "$1" cert
+	[ "$role" = rx ] && [ "$mix" = 1 ] && [ -z "$cert" ] || return 0
+	config_get ip "$1" ip
+	config_get port "$1" port 6980
+	config_get stream "$1" stream
+	tab="$(printf '\t')"; nl="
+"
+	[ -n "$stream" ] || stream=Mix
+	case "$ip$port$stream" in *"$tab"*|*"$nl"*) logger -t vbanhub "mix $1 skipped: bad value"; return 0 ;; esac
+	if [ -z "$ip" ] || [ "$stream" = '*' ] || [ ${#stream} -gt 16 ]; then
+		logger -t vbanhub "mix $1 skipped: bad address or stream name"; return 0
+	fi
+	printf 'mixdst\t%s\t%s\t%s\n' "$ip" "$port" "$stream" >> $CONF
+}
+
 gen_conf() {
 	mkdir -p /var/etc
 	local mgain mmute
@@ -99,6 +120,7 @@ gen_conf() {
 	[ "$mgain" -gt 200 ] && mgain=200
 	[ "$mmute" = 1 ] && mgain=0
 	printf 'master\t%s\n' "$mgain" >> $CONF
+	config_foreach gen_mix endpoint
 	config_foreach gen_route route
 }
 

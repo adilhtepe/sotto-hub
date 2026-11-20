@@ -31,6 +31,19 @@ The daemon route file is now TAB-separated (`route<TAB>ip<TAB>stream<TAB>ip<TAB>
 ## Stream names are optional
 VBAN receivers filter on the stream name, but the hub does not need you to type one. An **input** (transmitter) with no name accepts any stream from its IP (set a name only to pick one of several streams the same IP sends). An **output** (receiver) with no name gets the name the input used, unchanged (set one only when the receiver accepts just one specific name, then the hub rewrites it). Internally `*` means "any" / "keep"; typing `*` as a name is rejected. If one IP sends several streams to the same unnamed-input route they are all forwarded; name the input to pick one. Test: `test/test_names.py <binary>`.
 
+## Mixing several inputs into one stream
+Receivers that play one stream at a time (sotto, Voicemeeter) garble when two transmitters feed them, because the packets of
+both streams land in one jitter buffer. Mark the receiver **Mix inputs into one stream** (LuCI: receiver endpoint, or
+`option mix '1'` on the `endpoint`) and the hub sums every input routed to it into ONE stream: 48 kHz, stereo, s16, 128 frames
+(2.67 ms) per packet, one frame counter, named by the receiver's stream name (default `Mix`).
+- Each input has a small jitter buffer (starts at 20 ms fill). An input that underruns is silent until it refills; one whose
+  sender clock runs ahead is trimmed back. Inputs silent for 0.5 s are forgotten; with no inputs nothing is sent.
+- Per-route / input / output / master volume are applied to each input before the sum; the sum saturates.
+- Inputs must be PCM at 48 kHz, mono or stereo, s16 / s24 / s32 / f32. Others are counted as `unsupported` in the status and not mixed.
+- Mixed routes bypass the eBPF fast path (the daemon sums). Not available for secure (certificate) receivers.
+- Daemon config line: `mixdst<TAB>ip<TAB>port<TAB>stream`. Status: `mix` array (`inputs`, `running`, `pkts`, `under`, `over`, `unsupported`).
+- Code: `package/vbanhub/src/vbanhub_mix.c`. Test: `test/test_mix.py <binary>`.
+
 ## LuCI page: three tabs
 - **Mixer** (first tab): only the *Inputs* (transmitters) and *Outputs* (receivers), each with its own live state (signal/format/pkt/s or receiving/idle), who it is routed to, and its own volume + mute slider; plus the master volume. Secure endpoints show a lock and their certificate name.
 - **Settings**: everything else (hub settings, routes, endpoints, routing matrix, devices on the router, discovery, streams heard, status).
